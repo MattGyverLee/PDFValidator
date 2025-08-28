@@ -32,7 +32,7 @@ def detect_column_boundaries(page):
     Balanced column detection: Column widths are always equal, but gutters shift the centerline.
     Focus on identifying column blocks while ignoring spanning headers.
     """
-    raw = page.get_text("rawdict")
+    raw = page.get_text("dict")
     blocks = raw.get("blocks", [])
     
     page_width = page.rect.width
@@ -140,21 +140,26 @@ def text_spans_actually_overlap(rect1, text1, rect2, text2, column_boundaries=No
     - Horizontal overlap: Always problematic (especially cross-column)
     - Vertical overlap: Only when actual text areas touch (not just headroom)
     """
+    # Skip empty or whitespace-only text spans (common in PDFs with encoding issues)
+    text1_clean = text1.strip()
+    text2_clean = text2.strip()
+    if not text1_clean or not text2_clean:
+        return False
+    
     # First check if bounding boxes intersect at all
     inter = rect1 & rect2
     if inter.is_empty:
         return False
     
-    # Skip identical non-empty text (repeated headers, page numbers)
-    if text1.strip() == text2.strip() and text1.strip():
+    # Skip identical text (repeated headers, page numbers)
+    if text1_clean == text2_clean:
         return False
     
     # Skip if one text is completely contained in the other (OCR artifacts)
-    text1_clean = text1.strip().lower()
-    text2_clean = text2.strip().lower()
-    if text1_clean and text2_clean:
-        if text1_clean in text2_clean or text2_clean in text1_clean:
-            return False
+    text1_lower = text1_clean.lower()
+    text2_lower = text2_clean.lower()
+    if text1_lower in text2_lower or text2_lower in text1_lower:
+        return False
     
     # Calculate intersection dimensions
     inter_width = inter.x1 - inter.x0
@@ -162,28 +167,39 @@ def text_spans_actually_overlap(rect1, text1, rect2, text2, column_boundaries=No
     
     # HORIZONTAL OVERLAP DETECTION (always problematic - minimal text box padding)
     if inter_width > 0.1:  # Very strict - text boxes have minimal horizontal padding
-        # Horizontal overlap is always a problem because text boxes barely extend past text
-        center_x1 = (rect1.x0 + rect1.x1) / 2
-        center_x2 = (rect2.x0 + rect2.x1) / 2
+        # Skip if both spans are very wide (likely full-width paragraphs, not column text)
+        rect1_width = rect1.x1 - rect1.x0
+        rect2_width = rect2.x1 - rect2.x0
         
-        # Cross-column overlap is especially serious (first column extending into second)
-        if column_boundaries:
-            col1 = 0
-            col2 = 0
-            for boundary in column_boundaries:
-                if center_x1 > boundary:
-                    col1 += 1
-                if center_x2 > boundary:
-                    col2 += 1
+        # If both spans are very wide (>60% page width), they're likely paragraph blocks
+        # Horizontal overlap between paragraph blocks is usually just formatting
+        page_width = 419.5  # Approximate page width - could be passed as parameter
+        if rect1_width > page_width * 0.6 and rect2_width > page_width * 0.6:
+            # These are likely paragraph blocks, treat as vertical overlap instead
+            pass  # Fall through to vertical overlap logic
+        else:
+            # Narrow text blocks with horizontal overlap - this is always problematic
+            center_x1 = (rect1.x0 + rect1.x1) / 2
+            center_x2 = (rect2.x0 + rect2.x1) / 2
             
-            # Any cross-column overlap is a major issue
-            if col1 != col2:
+            # Cross-column overlap is especially serious (first column extending into second)
+            if column_boundaries:
+                col1 = 0
+                col2 = 0
+                for boundary in column_boundaries:
+                    if center_x1 > boundary:
+                        col1 += 1
+                    if center_x2 > boundary:
+                        col2 += 1
+                
+                # Any cross-column overlap is a major issue
+                if col1 != col2:
+                    return True
+            
+            # Even same-column horizontal overlap is problematic with minimal padding
+            # Only allow very tiny overlaps (possible rounding errors)
+            if inter_width > 0.5:
                 return True
-        
-        # Even same-column horizontal overlap is problematic with minimal padding
-        # Only allow very tiny overlaps (possible rounding errors)
-        if inter_width > 0.5:
-            return True
     
     # VERTICAL OVERLAP DETECTION - only flag when text actually touches
     if inter_height > 1.0:  # Some vertical overlap exists
@@ -325,7 +341,7 @@ def validate_text_justification(page, column_boundaries=None):
     page_width = page.rect.width
     
     # Get all text spans first to analyze layout
-    raw = page.get_text("rawdict")
+    raw = page.get_text("dict")
     blocks = raw.get("blocks", [])
     
     all_spans = []
@@ -435,7 +451,7 @@ def analyze_gutter_margins(doc, min_margin_pts=36.0):
         page_num = page_idx + 1  # 1-based page numbering
         
         # Get text blocks to estimate actual margins
-        raw = page.get_text("rawdict")
+        raw = page.get_text("dict")
         blocks = raw.get("blocks", [])
         
         if not blocks:
@@ -554,7 +570,7 @@ def check_guttered_margins(page, page_number, margin_analysis, min_acceptable_ma
     bottom_margin_zone = fitz.Rect(pr.x0, pr.y1 - expected_margins["bottom"], pr.x1, pr.y1)
     
     # Get text and image elements
-    raw = page.get_text("rawdict")
+    raw = page.get_text("dict")
     blocks = raw.get("blocks", [])
     
     text_rects = []
@@ -682,7 +698,7 @@ def analyze_color_usage(page):
     issues = []
     try:
         # Get all drawing operations
-        raw = page.get_text("rawdict")
+        raw = page.get_text("dict")
         blocks = raw.get("blocks", [])
         
         rgb_found = False
@@ -737,7 +753,7 @@ def validate_page_numbering(doc):
     
     for pno in range(len(doc)):
         page = doc[pno]
-        raw = page.get_text("rawdict")
+        raw = page.get_text("dict")
         blocks = raw.get("blocks", [])
         
         page_rect = page.rect
@@ -835,7 +851,7 @@ def check_baseline_alignment(page, grid_threshold=2.0):
     baselines = []
     
     try:
-        raw = page.get_text("rawdict")
+        raw = page.get_text("dict")
         blocks = raw.get("blocks", [])
         
         for block in blocks:
@@ -884,7 +900,7 @@ def check_column_balance(page, balance_threshold=0.15):
     issues = []
     
     try:
-        raw = page.get_text("rawdict")
+        raw = page.get_text("dict")
         blocks = raw.get("blocks", [])
         
         # Group text blocks by approximate column
@@ -942,7 +958,7 @@ def check_page(page, margin_pts, dpi_threshold, page_number=None, total_pages=No
     bottom_m = fitz.Rect(pr.x0, pr.y1 - margin_pts, pr.x1, pr.y1)
 
     # Gather text blocks / spans / glyphs and images
-    raw = page.get_text("rawdict")
+    raw = page.get_text("dict")
     blocks = raw.get("blocks", [])
 
     text_rects = []     # span-level rects
@@ -1158,7 +1174,7 @@ def check_thumb_tabs_removed():
         cropbox = page.cropbox
         
         # Look for elements extending beyond crop box (potential thumb tabs)
-        raw = page.get_text("rawdict")
+        raw = page.get_text("dict")
         blocks = raw.get("blocks", [])
         
         tab_elements = []
@@ -1273,14 +1289,57 @@ def check_page_original(page, margin_pts, dpi_threshold):
     except Exception:
         pass
 
-    # Margin zones
-    left_m   = fitz.Rect(pr.x0, pr.y0, pr.x0 + margin_pts, pr.y1)
-    right_m  = fitz.Rect(pr.x1 - margin_pts, pr.y0, pr.x1, pr.y1)
+    # Get text spans first to calculate adaptive margins (same as green box logic)
+    raw = page.get_text("dict")
+    blocks = raw.get("blocks", [])
+    page_height = pr.height
+    header_zone = page_height * 0.1
+    footer_zone = page_height * 0.9
+    
+    body_text_spans = []
+    for b in blocks:
+        if b["type"] == 0:  # text block
+            for line in b.get("lines", []):
+                for span in line.get("spans", []):
+                    bbox = fitz.Rect(span["bbox"]) if span.get("bbox") else None
+                    text = span.get("text", "")
+                    if bbox and bbox.width > 2 and bbox.height > 2 and text.strip():
+                        span_center_y = (bbox.y0 + bbox.y1) / 2
+                        if header_zone < span_center_y < footer_zone:
+                            body_text_spans.append(bbox)
+    
+    # Calculate adaptive margins using EXACT same logic as green boxes
+    # Import detect_column_boundaries function (already defined above)
+    column_boundaries = detect_column_boundaries(page)
+    
+    if body_text_spans:
+        body_x_coords = [r.x0 for r in body_text_spans] + [r.x1 for r in body_text_spans]
+        body_x_coords.sort()
+        
+        text_left = min(body_x_coords)
+        text_right = max(body_x_coords)
+        
+        if column_boundaries:
+            # Multi-column: use exact green box logic
+            actual_divider = column_boundaries[0]
+            adaptive_left_margin = max(36.0, text_left - 5)  # Small padding (same as green box)
+            adaptive_right_margin = min(pr.width - 36.0, text_right + 5)  # Small padding
+        else:
+            # Single column: use exact green box logic  
+            adaptive_left_margin = max(36.0, text_left - 8)  # 8pt padding (same as green box)
+            adaptive_right_margin = min(pr.width - 36.0, text_right + 8)  # 8pt padding
+    else:
+        # Fallback to standard margins
+        adaptive_left_margin = margin_pts
+        adaptive_right_margin = pr.width - margin_pts
+    
+    # Create margin zones using adaptive margins (aligned with green box positioning)
+    left_m   = fitz.Rect(pr.x0, pr.y0, adaptive_left_margin, pr.y1)
+    right_m  = fitz.Rect(adaptive_right_margin, pr.y0, pr.x1, pr.y1)
     top_m    = fitz.Rect(pr.x0, pr.y0, pr.x1, pr.y0 + margin_pts)
     bottom_m = fitz.Rect(pr.x0, pr.y1 - margin_pts, pr.x1, pr.y1)
 
-    # Gather text blocks / spans / glyphs and images
-    raw = page.get_text("rawdict")
+    # Gather text blocks / spans / glyphs and images (reusing parsed blocks)
     blocks = raw.get("blocks", [])
 
     text_rects = []     # span-level rects
@@ -1551,7 +1610,7 @@ def annotate_pdf(input_path, output_path, per_page_issues, document_issues=None,
         page_height = page.rect.height
         
         # Get all text spans, excluding headers/footers
-        raw = page.get_text("rawdict")
+        raw = page.get_text("dict")
         blocks = raw.get("blocks", [])
         
         # Define header/footer zones (top 10% and bottom 10% of page)
@@ -2297,7 +2356,7 @@ def check_hyphenation_at_breaks(page, next_page=None):
     issues = []
     
     try:
-        raw = page.get_text("rawdict")
+        raw = page.get_text("dict")
         blocks = raw.get("blocks", [])
         
         # Find text blocks and get last lines
@@ -2400,7 +2459,7 @@ def check_line_spacing_consistency(page, tolerance_pts=2.0):
     issues = []
     
     try:
-        raw = page.get_text("rawdict")
+        raw = page.get_text("dict")
         blocks = raw.get("blocks", [])
         
         all_spacings = []
@@ -2562,7 +2621,7 @@ def check_header_consistency(page, page_number=None, total_pages=None):
     issues = []
     
     try:
-        raw = page.get_text("rawdict")
+        raw = page.get_text("dict")
         blocks = raw.get("blocks", [])
         
         page_height = page.rect.height
