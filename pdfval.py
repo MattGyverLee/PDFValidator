@@ -100,7 +100,7 @@ def rects_intersect(a, b, iou_thresh=0.05):
 
 def detect_column_boundaries(page):
     """
-    Balanced column detection: Column widths are always equal, but gutters shift the centerline.
+    Balanced column detection: Column widths should be always equal (and this is an error if they are not), but binding gutters shift the centerline.
     Try block-based detection first, then fall back to span-based detection for PDFs with large blocks.
     """
     raw = page.get_text("dict")
