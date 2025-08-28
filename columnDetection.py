@@ -351,22 +351,53 @@ class ColumnDetector:
             visual_divider = self._detect_visual_separator()
             
             if visual_divider and abs(visual_divider - divider) < 1:  # Same divider
-                # Visual separator: create symmetric columns around center
-                left_boundary_distance = divider - min_x
-                symmetric_right_boundary = divider + left_boundary_distance
+                # Visual separator: allow inner boundaries to hug text more closely
+                # Find actual text boundaries for each column
+                tolerance = 10.0  # pts tolerance around visual separator
+                left_column_text = [span for span in body_spans if span['bbox'].x1 < divider - tolerance]
+                right_column_text = [span for span in body_spans if span['bbox'].x0 > divider + tolerance]
                 
-                # Ensure we don't exceed page boundaries
-                final_right_boundary = min(symmetric_right_boundary, self.page_width)
-                
-                left_region = TextRegion(
-                    bbox=fitz.Rect(min_x, min_y, divider, max_y),
-                    text_type='body_left'
-                )
-                right_region = TextRegion(
-                    bbox=fitz.Rect(divider, min_y, final_right_boundary, max_y),
-                    text_type='body_right'
-                )
-                regions.extend([left_region, right_region])
+                if left_column_text and right_column_text:
+                    # Get text edges for each column
+                    rightmost_left_text = max(span['bbox'].x1 for span in left_column_text)
+                    leftmost_right_text = min(span['bbox'].x0 for span in right_column_text)
+                    
+                    # Calculate text-hugging inner boundaries with 6pt movement limit
+                    max_movement = 6.0
+                    
+                    # Left column right boundary: move toward text but max 6pts from center
+                    left_inner_boundary = max(divider - max_movement, rightmost_left_text + boundary_margin)
+                    
+                    # Right column left boundary: move toward text but max 6pts from center  
+                    right_inner_boundary = min(divider + max_movement, leftmost_right_text - boundary_margin)
+                    
+                    # Maintain symmetric outer boundaries
+                    left_boundary_distance = divider - min_x
+                    final_right_boundary = min(divider + left_boundary_distance, self.page_width)
+                    
+                    left_region = TextRegion(
+                        bbox=fitz.Rect(min_x, min_y, left_inner_boundary, max_y),
+                        text_type='body_left'
+                    )
+                    right_region = TextRegion(
+                        bbox=fitz.Rect(right_inner_boundary, min_y, final_right_boundary, max_y),
+                        text_type='body_right'
+                    )
+                    regions.extend([left_region, right_region])
+                else:
+                    # Fallback to center line if no text found
+                    left_boundary_distance = divider - min_x
+                    final_right_boundary = min(divider + left_boundary_distance, self.page_width)
+                    
+                    left_region = TextRegion(
+                        bbox=fitz.Rect(min_x, min_y, divider, max_y),
+                        text_type='body_left'
+                    )
+                    right_region = TextRegion(
+                        bbox=fitz.Rect(divider, min_y, final_right_boundary, max_y),
+                        text_type='body_right'
+                    )
+                    regions.extend([left_region, right_region])
             else:
                 # Text-based divider: use actual text boundaries
                 left_region = TextRegion(
