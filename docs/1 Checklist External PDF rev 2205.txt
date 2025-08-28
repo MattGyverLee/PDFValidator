@@ -1,0 +1,41 @@
+﻿External PDFs
+[Project Name]New Testament
+All files PDF/X compliant 	
+Cover, spine, text PDFs black-&-white (K=100%) 	
+Cover: compare publication names on cover and title pages 	
+Front matter: even number of pages 	
+Logo on title page 	
+Verso page: book title 	
+Picture copyrights with correct page numbers 	
+Consistent style & format 	
+Book copyright holder 	
+Capitalization 	
+Other information (e.g., ISBN, # copies, etc.) 	
+TOC: compare book titles & page numbers with book pages 	
+Other front matter: page numbers (if any) 	
+Main Body
+Page number sequence between books 	
+Headers: name, chapter, numbers left and right 	
+Footnotes: location, reference 	
+Cross-references: location, reference 	
+Vertical and/or horizontal lines complete & correctly spaced 	
+Pictures: copyrights, captions & references 	
+Not covering up text 	
+On / within 1 page of reference 	
+Quality OK 	
+Not screened 	
+Color pictures / maps: CMYK 	
+Color maps: black overprinted 	
+Maps for double-page spread complete 	
+Hyphens at end of page 	
+Column balance 	
+Thumb tabs: compare index page with book pages 	
+Thumb tabs bleeding off page at least 5 mm 	
+Text in thumb tabs at least 3 mm from trimmed edge 	
+Body text on baseline grid 	
+Consistency throughout for line spacing and any special features 	
+Back Matter: consistent in appearance 	
+Page sizes 	
+Crop marks (3mm apart) 	
+Dummy 	
+Other observations 	
