@@ -362,14 +362,15 @@ class ColumnDetector:
                     rightmost_left_text = max(span['bbox'].x1 for span in left_column_text)
                     leftmost_right_text = min(span['bbox'].x0 for span in right_column_text)
                     
-                    # Calculate text-hugging inner boundaries with 6pt movement limit
-                    max_movement = 6.0
+                    # Calculate inner boundaries with 2pt space from text and 6pt movement limit
+                    text_clearance = 2.0  # 2pt space between text and inner boundary
+                    max_movement = 4.0
                     
-                    # Left column right boundary: move toward text but max 6pts from center
-                    left_inner_boundary = max(divider - max_movement, rightmost_left_text + boundary_margin)
+                    # Left column right boundary: text + 2pt clearance, max 4pts from center
+                    left_inner_boundary = max(divider - max_movement, rightmost_left_text + text_clearance)
                     
-                    # Right column left boundary: move toward text but max 6pts from center  
-                    right_inner_boundary = min(divider + max_movement, leftmost_right_text - boundary_margin)
+                    # Right column left boundary: text - 2pt clearance, max 4pts from center  
+                    right_inner_boundary = min(divider + max_movement, leftmost_right_text - text_clearance)
                     
                     # Maintain symmetric outer boundaries
                     left_boundary_distance = divider - min_x
