@@ -29,47 +29,110 @@ def rects_intersect(a, b, iou_thresh=0.05):
 
 def detect_column_boundaries(page):
     """
-    Analyze page to detect column boundaries for better overlap detection
+    Balanced column detection: Column widths are always equal, but gutters shift the centerline.
+    Focus on identifying column blocks while ignoring spanning headers.
     """
     raw = page.get_text("rawdict")
     blocks = raw.get("blocks", [])
     
-    # Collect all text x-positions to find natural column breaks
-    x_positions = []
+    page_width = page.rect.width
+    page_height = page.rect.height
+    
+    # Get body text only (excluding headers/footers)
+    header_zone = page_height * 0.1
+    footer_zone = page_height * 0.9
+    
+    # Identify column blocks vs spanning blocks (headers/footers)
+    body_blocks = []
     for b in blocks:
         if b["type"] == 0:  # text block
-            for line in b.get("lines", []):
-                for span in line.get("spans", []):
-                    bbox = span.get("bbox", [])
-                    if bbox and span.get("text", "").strip():  # Only actual text
-                        x_positions.extend([bbox[0], bbox[2]])  # left and right edges
+            block_bbox = b.get("bbox", [])
+            if block_bbox:
+                block_center_y = (block_bbox[1] + block_bbox[3]) / 2
+                block_height = block_bbox[3] - block_bbox[1]
+                block_width = block_bbox[2] - block_bbox[0]
+                
+                # Only consider substantial body text blocks
+                if (header_zone < block_center_y < footer_zone and 
+                    block_height > 20 and block_width > 40):
+                    body_blocks.append(b)
     
-    if not x_positions:
-        # Fallback: assume standard 2-column layout
-        page_width = page.rect.width
-        return [page_width / 2]
+    if not body_blocks:
+        return []  # No significant body text
     
-    x_positions.sort()
-    page_width = page.rect.width
+    # Classify blocks as narrow (column) vs wide (spanning)
+    page_center = page_width / 2
+    narrow_blocks = []  # Likely column content
+    wide_blocks = []    # Likely spanning headers
     
-    # Find natural gaps in text positioning (likely column boundaries)
-    gaps = []
-    gap_threshold = 20  # Points - minimum gap to consider a column boundary
+    for block in body_blocks:
+        bbox = block["bbox"]
+        block_width = bbox[2] - bbox[0]
+        
+        # Wide blocks that span most of the page are likely headers/titles
+        if block_width > page_width * 0.6:
+            wide_blocks.append(block)
+        else:
+            narrow_blocks.append(block)
     
-    for i in range(1, len(x_positions)):
-        gap = x_positions[i] - x_positions[i-1]
-        if gap > gap_threshold:
-            gap_center = (x_positions[i-1] + x_positions[i]) / 2
-            if page_width * 0.2 < gap_center < page_width * 0.8:  # Must be reasonable position
-                gaps.append(gap_center)
+    # If mostly wide blocks, this is single column
+    if len(narrow_blocks) <= 1:
+        return []  # Single column layout
     
-    # Return the most likely column boundaries (remove duplicates)
-    column_boundaries = []
-    for gap in gaps:
-        if not any(abs(gap - existing) < 30 for existing in column_boundaries):
-            column_boundaries.append(gap)
+    # Analyze narrow blocks to find column structure
+    # Look for blocks that are clearly on left vs right side of page
+    left_column_blocks = []
+    right_column_blocks = []
     
-    return sorted(column_boundaries) if column_boundaries else [page_width / 2]
+    for block in narrow_blocks:
+        bbox = block["bbox"]
+        block_left = bbox[0]
+        block_right = bbox[2]
+        
+        # More sophisticated classification based on block edges, not just center
+        # Left column: starts near left margin and doesn't extend past center
+        # Right column: starts after center and extends to right
+        
+        if block_left < page_width * 0.3 and block_right < page_center + 20:
+            left_column_blocks.append(block)
+        elif block_left > page_center - 20 and block_right > page_width * 0.7:
+            right_column_blocks.append(block)
+        # Blocks that don't clearly fit either side are ignored (likely spanning elements)
+    
+    # Must have blocks in both columns for multi-column layout
+    if not left_column_blocks or not right_column_blocks:
+        return []  # Single column
+    
+    # Find the edges of each column
+    left_edges = [b["bbox"][2] for b in left_column_blocks]  # Right edges of left column
+    right_edges = [b["bbox"][0] for b in right_column_blocks]  # Left edges of right column
+    
+    left_column_end = max(left_edges)
+    right_column_start = min(right_edges)
+    
+    # Calculate balanced column layout
+    # The key insight: column widths should be equal, gutter shifts the center
+    gap_size = right_column_start - left_column_end
+    
+    if gap_size > 5:  # Reasonable gap between columns
+        # Calculate what the divider should be for BALANCED columns
+        # Get actual text margins
+        all_left_edges = [b["bbox"][0] for b in left_column_blocks]
+        all_right_edges = [b["bbox"][2] for b in right_column_blocks]
+        
+        left_margin = min(all_left_edges)
+        right_margin = max(all_right_edges)
+        
+        # For balanced columns: each column gets equal width
+        available_width = right_margin - left_margin
+        column_width = (available_width - gap_size) / 2
+        
+        # The divider should be positioned to create balanced columns
+        balanced_divider = left_margin + column_width + (gap_size / 2)
+        
+        return [balanced_divider]
+    
+    return []  # Single column fallback
 
 def text_spans_actually_overlap(rect1, text1, rect2, text2, column_boundaries=None):
     """
@@ -1514,10 +1577,15 @@ def annotate_pdf(input_path, output_path, per_page_issues, document_issues=None,
         left_margin = 36.0  # 0.5 inch
         right_margin = page_width - 36.0
         
-        # Detect column boundaries for THIS specific page
+        # For facing pages, use consistent column divider but adaptive margins
+        # Detect the logical column divider position (should be consistent)
         column_boundaries = detect_column_boundaries(page)
         
-        # Analyze actual text positioning on this page to determine adaptive margins
+        # Determine if this is a facing page layout and adapt accordingly
+        page_number = pno + 1  # 1-based page numbering
+        is_right_facing = (page_number % 2 == 1)  # Odd pages are right-facing
+        
+        # Analyze actual text positioning to determine gutter-aware margins
         if body_text_spans:
             # Find the leftmost and rightmost text positions (excluding outliers)
             body_x_coords = [r.x0 for r in body_text_spans] + [r.x1 for r in body_text_spans]
@@ -1527,7 +1595,7 @@ def annotate_pdf(input_path, output_path, per_page_issues, document_issues=None,
             left_text_edge = body_x_coords[max(0, int(len(body_x_coords) * 0.05))]
             right_text_edge = body_x_coords[min(len(body_x_coords)-1, int(len(body_x_coords) * 0.95))]
             
-            # Adaptive margins based on actual text distribution
+            # Adaptive margins based on actual text distribution for this page
             adaptive_left_margin = max(left_margin, left_text_edge - 5)  # At least 5pt padding
             adaptive_right_margin = min(right_margin, right_text_edge + 5)  # At least 5pt padding
         else:
@@ -1535,30 +1603,75 @@ def annotate_pdf(input_path, output_path, per_page_issues, document_issues=None,
             adaptive_right_margin = right_margin
         
         if not column_boundaries:
-            # Single column - use adaptive margins for this specific page
+            # Single column - create a well-sized box with reasonable margins
             body_y_coords = [r.y0 for r in body_text_spans] + [r.y1 for r in body_text_spans]
+            body_x_coords = [r.x0 for r in body_text_spans] + [r.x1 for r in body_text_spans]
             
-            if body_y_coords:
+            if body_y_coords and body_x_coords:
+                # Use actual text bounds but add generous margins for single column
+                text_left = min(body_x_coords)
+                text_right = max(body_x_coords)
+                text_top = min(body_y_coords)
+                text_bottom = max(body_y_coords)
+                
+                # Add margins to ensure text doesn't escape (slightly more generous)
+                margin_left = max(left_margin, text_left - 8)  # 8pt padding
+                margin_right = min(right_margin, text_right + 8)  # 8pt padding
+                
                 column_box = fitz.Rect(
-                    adaptive_left_margin,
-                    min(body_y_coords) - 10,
-                    adaptive_right_margin, 
-                    max(body_y_coords) + 10
+                    margin_left,
+                    text_top - 10,
+                    margin_right, 
+                    text_bottom + 10
                 )
                 page.draw_rect(column_box, color=(0, 0.7, 0), width=2)
         else:
-            # Multi-column - adapt to THIS page's detected boundary
-            main_boundary = column_boundaries[0]
+            # Multi-column with balanced widths - gutter may shift but columns are equal width
+            actual_divider_position = column_boundaries[0]
             
-            # Column boxes should touch at the boundary line - no gap
-            # Left column extends right up to the boundary
-            # Right column starts right at the boundary
-            left_column_right_edge = main_boundary
-            right_column_left_edge = main_boundary
-            
-            # Ensure columns don't extend beyond adaptive margins
-            left_column_left_edge = adaptive_left_margin
-            right_column_right_edge = adaptive_right_margin
+            # Get actual text bounds to determine proper margins
+            body_x_coords = [r.x0 for r in body_text_spans] + [r.x1 for r in body_text_spans]
+            if body_x_coords:
+                text_left = min(body_x_coords)
+                text_right = max(body_x_coords)
+                
+                # Calculate balanced column widths
+                total_text_width = text_right - text_left
+                available_width = text_right - text_left
+                
+                # Each column gets equal width
+                column_width = available_width / 2
+                
+                # Position columns symmetrically around the divider but with equal widths
+                left_column_left_edge = max(left_margin, text_left - 5)  # Small padding
+                left_column_right_edge = actual_divider_position
+                right_column_left_edge = actual_divider_position  
+                right_column_right_edge = min(right_margin, text_right + 5)  # Small padding
+                
+                # Ensure columns are balanced by adjusting if necessary
+                left_width = left_column_right_edge - left_column_left_edge
+                right_width = right_column_right_edge - right_column_left_edge
+                
+                # If widths are significantly different, balance them
+                if abs(left_width - right_width) > 20:  # More than 20pt difference
+                    target_width = (left_width + right_width) / 2
+                    
+                    # Adjust column edges to create equal widths
+                    gap_center = actual_divider_position
+                    left_column_left_edge = gap_center - target_width
+                    left_column_right_edge = gap_center
+                    right_column_left_edge = gap_center
+                    right_column_right_edge = gap_center + target_width
+                    
+                    # Ensure we don't go outside reasonable page bounds
+                    left_column_left_edge = max(left_margin, left_column_left_edge)
+                    right_column_right_edge = min(right_margin, right_column_right_edge)
+            else:
+                # Fallback to adaptive margins
+                left_column_left_edge = adaptive_left_margin
+                left_column_right_edge = actual_divider_position
+                right_column_left_edge = actual_divider_position
+                right_column_right_edge = adaptive_right_margin
             
             # Get Y bounds from body text
             all_body_y = [r.y0 for r in body_text_spans] + [r.y1 for r in body_text_spans]
