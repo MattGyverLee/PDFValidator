@@ -322,7 +322,7 @@ class ColumnDetector:
         all_body_y = [coord for span in body_spans for coord in [span['bbox'].y0, span['bbox'].y1]]
         
         # Calculate boundaries with visual clearance
-        boundary_margin = 12.0  # Visual clearance around text
+        boundary_margin = 2.0  # Visual clearance around text
         min_y = min(all_body_y) - boundary_margin
         max_y = max(all_body_y) + boundary_margin
         
