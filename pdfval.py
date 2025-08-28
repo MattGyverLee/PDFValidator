@@ -97,14 +97,14 @@ def text_spans_actually_overlap(rect1, text1, rect2, text2, column_boundaries=No
     inter_width = inter.x1 - inter.x0
     inter_height = inter.y1 - inter.y0
     
-    # HORIZONTAL OVERLAP DETECTION (high priority - always problematic)
-    if inter_width > 0.5:  # Any meaningful horizontal overlap
-        # Check if this is cross-column overlap (more serious)
+    # HORIZONTAL OVERLAP DETECTION (always problematic - minimal text box padding)
+    if inter_width > 0.1:  # Very strict - text boxes have minimal horizontal padding
+        # Horizontal overlap is always a problem because text boxes barely extend past text
         center_x1 = (rect1.x0 + rect1.x1) / 2
         center_x2 = (rect2.x0 + rect2.x1) / 2
         
+        # Cross-column overlap is especially serious (first column extending into second)
         if column_boundaries:
-            # Determine which column each text is in
             col1 = 0
             col2 = 0
             for boundary in column_boundaries:
@@ -113,17 +113,14 @@ def text_spans_actually_overlap(rect1, text1, rect2, text2, column_boundaries=No
                 if center_x2 > boundary:
                     col2 += 1
             
-            # Cross-column overlap is always flagged
+            # Any cross-column overlap is a major issue
             if col1 != col2:
                 return True
-            
-            # Same-column overlap - check if it's extending into margins or other columns
-            if inter_width > 5.0:  # Significant same-column overlap
-                return True
-        else:
-            # No column info - flag significant horizontal overlaps
-            if inter_width > 2.0:
-                return True
+        
+        # Even same-column horizontal overlap is problematic with minimal padding
+        # Only allow very tiny overlaps (possible rounding errors)
+        if inter_width > 0.5:
+            return True
     
     # VERTICAL OVERLAP DETECTION - only flag when text actually touches
     if inter_height > 1.0:  # Some vertical overlap exists
@@ -150,29 +147,44 @@ def text_spans_actually_overlap(rect1, text1, rect2, text2, column_boundaries=No
         box1_height = rect1.y1 - rect1.y0
         box2_height = rect2.y1 - rect2.y0
         
-        # More conservative text area estimation
-        # Assume text occupies middle 60% of box height (40% is headroom/leading)
-        text_ratio = 0.6
-        headroom_ratio = (1.0 - text_ratio) / 2  # 20% top and bottom
+        # Estimate actual text area within text boxes (accounting for headroom/footspace)
+        # Text boxes have significant vertical padding (headroom above, footspace below)
+        # Only flag when estimated actual text areas would touch and affect legibility
         
-        # Calculate estimated text bounds
-        text1_top = rect1.y0 + (box1_height * headroom_ratio)
-        text1_bottom = rect1.y1 - (box1_height * headroom_ratio)
+        # Conservative estimation: text occupies middle portion of text box
+        # Larger text boxes likely have more headroom
+        def estimate_text_area_ratio(box_height):
+            if box_height < 8:   # Very small boxes - mostly text
+                return 0.8
+            elif box_height < 15:  # Normal single line - some headroom
+                return 0.6
+            else:  # Large boxes - significant headroom/leading
+                return 0.4
         
-        text2_top = rect2.y0 + (box2_height * headroom_ratio)
-        text2_bottom = rect2.y1 - (box2_height * headroom_ratio)
+        text1_ratio = estimate_text_area_ratio(box1_height)
+        text2_ratio = estimate_text_area_ratio(box2_height)
+        
+        # Calculate estimated text bounds (centered in box)
+        text1_padding = box1_height * (1.0 - text1_ratio) / 2
+        text1_top = rect1.y0 + text1_padding
+        text1_bottom = rect1.y1 - text1_padding
+        
+        text2_padding = box2_height * (1.0 - text2_ratio) / 2
+        text2_top = rect2.y0 + text2_padding
+        text2_bottom = rect2.y1 - text2_padding
         
         # Check if estimated text areas actually overlap
         text_overlap_top = max(text1_top, text2_top)
         text_overlap_bottom = min(text1_bottom, text2_bottom)
         
         if text_overlap_bottom > text_overlap_top:
-            # There is estimated text-to-text overlap
+            # Estimated text areas do overlap vertically
             text_overlap_height = text_overlap_bottom - text_overlap_top
             
-            # Only flag if overlap is substantial enough to affect legibility
-            min_problematic_overlap = 1.5  # Points
-            if text_overlap_height > min_problematic_overlap:
+            # Only flag if overlap would significantly affect legibility
+            # Be more conservative - allow overlap unless text areas really touch
+            min_legible_separation = 4.0  # More generous minimum separation for readability
+            if text_overlap_height > min_legible_separation:
                 return True
     
     return False
@@ -231,6 +243,97 @@ def identify_problematic_line(rect1, text1, rect2, text2, column_boundaries):
                 return 1
     
     return None
+
+def validate_text_justification(page, column_boundaries=None):
+    """
+    Validate text justification by checking if text extends into margins.
+    Text should be properly justified and not extend beyond expected margins.
+    """
+    issues = []
+    
+    if not column_boundaries:
+        # Detect column boundaries if not provided
+        column_boundaries = detect_column_boundaries(page)
+    
+    if not column_boundaries:
+        return issues
+    
+    main_boundary = column_boundaries[0]
+    page_width = page.rect.width
+    
+    # Get all text spans first to analyze layout
+    raw = page.get_text("rawdict")
+    blocks = raw.get("blocks", [])
+    
+    all_spans = []
+    for b in blocks:
+        if b["type"] == 0:  # text block
+            for line in b.get("lines", []):
+                for span in line.get("spans", []):
+                    bbox = fitz.Rect(span["bbox"])
+                    text = span.get("text", "")
+                    if bbox.width > 5:  # Only substantial spans
+                        all_spans.append((bbox, text))
+    
+    if not all_spans:
+        return issues
+    
+    # Check if this is actually a multi-column layout
+    # Analyze column positioning
+    col1_spans = []
+    col2_spans = []
+    
+    for bbox, text in all_spans:
+        center_x = (bbox.x0 + bbox.x1) / 2
+        if center_x < main_boundary:
+            col1_spans.append((bbox, text))
+        else:
+            col2_spans.append((bbox, text))
+    
+    # If we don't have a reasonable distribution between columns, skip gutter validation
+    # This handles single-column layouts or where boundary detection failed
+    total_spans = len(all_spans)
+    if total_spans > 0:
+        left_ratio = len(col1_spans) / total_spans
+        right_ratio = len(col2_spans) / total_spans
+        
+        # If more than 80% of text is on one side, treat as single column
+        if left_ratio > 0.8 or right_ratio > 0.8:
+            return issues  # Skip gutter validation for single-column layouts
+        
+        # If we have very few spans total, the boundary detection may be unreliable
+        if total_spans < 10:
+            return issues
+    
+    # Check for text extending into gutter area (column boundary violations)
+    gutter_tolerance = 5.0  # Allow 5pt buffer from column boundary
+    
+    for bbox, text in all_spans:
+        if bbox.x1 - bbox.x0 > 10:  # Only check substantial text spans
+            # Check if text crosses or gets too close to column boundary
+            if bbox.x0 < main_boundary < bbox.x1:
+                # Text definitely crosses the boundary
+                issues.append({
+                    "type": "text_extends_to_gutter", 
+                    "bbox": [bbox.x0, bbox.y0, bbox.x1, bbox.y1],
+                    "detail": f"Text crosses column boundary: extends from x={bbox.x0:.1f} to x={bbox.x1:.1f}, crossing boundary at {main_boundary:.1f}"
+                })
+            elif abs(bbox.x1 - main_boundary) < gutter_tolerance and bbox.x0 < main_boundary:
+                # Left column text getting too close to boundary
+                issues.append({
+                    "type": "text_extends_to_gutter", 
+                    "bbox": [bbox.x0, bbox.y0, bbox.x1, bbox.y1],
+                    "detail": f"Text extends to x={bbox.x1:.1f}, too close to column boundary at {main_boundary:.1f}"
+                })
+            elif abs(bbox.x0 - main_boundary) < gutter_tolerance and bbox.x1 > main_boundary:
+                # Right column text getting too close to boundary
+                issues.append({
+                    "type": "text_extends_to_gutter",
+                    "bbox": [bbox.x0, bbox.y0, bbox.x1, bbox.y1], 
+                    "detail": f"Text starts at x={bbox.x0:.1f}, too close to column boundary at {main_boundary:.1f}"
+                })
+    
+    return issues
 
 def analyze_gutter_margins(doc, min_margin_pts=36.0):
     """
@@ -1084,6 +1187,9 @@ def check_page_enhanced(page, margin_pts, dpi_threshold, page_number=None, total
         
         # 5. Header consistency detection
         issues.extend(check_header_consistency(page, page_number, total_pages))
+        
+        # 6. Text justification validation
+        issues.extend(validate_text_justification(page))
     
     return issues
 
@@ -1250,6 +1356,7 @@ def annotate_pdf(input_path, output_path, per_page_issues, document_issues=None,
         "insufficient_margins": (0.8,0,0),
         "overlap_text_text": (0,0,1),
         "text_crosses_column_boundary": (1,0,0.5),  # Red-purple for column boundary violations
+        "text_extends_to_gutter": (0.9,0,0.4),  # Dark pink for gutter extension
         "overlap_text_image": (0.5,0,0.5),
         "low_dpi_image": (1,0.5,0),
         "dpi_unknown_image": (0.5,0.5,0.5),
@@ -1373,6 +1480,112 @@ def annotate_pdf(input_path, output_path, per_page_issues, document_issues=None,
                 
                 page.add_text_annot(annot_point, label)
                 page_annotations.append(annot_point)
+    
+    # Draw green column outline boxes on each page
+    for pno in range(len(doc)):
+        page = doc[pno]
+        page_width = page.rect.width
+        page_height = page.rect.height
+        
+        # Get all text spans, excluding headers/footers
+        raw = page.get_text("rawdict")
+        blocks = raw.get("blocks", [])
+        
+        # Define header/footer zones (top 10% and bottom 10% of page)
+        header_zone = page_height * 0.1
+        footer_zone = page_height * 0.9
+        
+        body_text_spans = []
+        for b in blocks:
+            if b["type"] == 0:  # text block
+                for line in b.get("lines", []):
+                    for span in line.get("spans", []):
+                        bbox = fitz.Rect(span["bbox"])
+                        if bbox.width > 2 and bbox.height > 2:  # Skip tiny spans
+                            # Skip headers and footers
+                            span_center_y = (bbox.y0 + bbox.y1) / 2
+                            if header_zone < span_center_y < footer_zone:
+                                body_text_spans.append(bbox)
+        
+        if not body_text_spans:
+            continue  # Skip pages with no body text
+        
+        # Standard margins
+        left_margin = 36.0  # 0.5 inch
+        right_margin = page_width - 36.0
+        
+        # Detect column boundaries for THIS specific page
+        column_boundaries = detect_column_boundaries(page)
+        
+        # Analyze actual text positioning on this page to determine adaptive margins
+        if body_text_spans:
+            # Find the leftmost and rightmost text positions (excluding outliers)
+            body_x_coords = [r.x0 for r in body_text_spans] + [r.x1 for r in body_text_spans]
+            body_x_coords.sort()
+            
+            # Use 5th and 95th percentile to exclude outliers
+            left_text_edge = body_x_coords[max(0, int(len(body_x_coords) * 0.05))]
+            right_text_edge = body_x_coords[min(len(body_x_coords)-1, int(len(body_x_coords) * 0.95))]
+            
+            # Adaptive margins based on actual text distribution
+            adaptive_left_margin = max(left_margin, left_text_edge - 5)  # At least 5pt padding
+            adaptive_right_margin = min(right_margin, right_text_edge + 5)  # At least 5pt padding
+        else:
+            adaptive_left_margin = left_margin
+            adaptive_right_margin = right_margin
+        
+        if not column_boundaries:
+            # Single column - use adaptive margins for this specific page
+            body_y_coords = [r.y0 for r in body_text_spans] + [r.y1 for r in body_text_spans]
+            
+            if body_y_coords:
+                column_box = fitz.Rect(
+                    adaptive_left_margin,
+                    min(body_y_coords) - 10,
+                    adaptive_right_margin, 
+                    max(body_y_coords) + 10
+                )
+                page.draw_rect(column_box, color=(0, 0.7, 0), width=2)
+        else:
+            # Multi-column - adapt to THIS page's detected boundary
+            main_boundary = column_boundaries[0]
+            
+            # Column boxes should touch at the boundary line - no gap
+            # Left column extends right up to the boundary
+            # Right column starts right at the boundary
+            left_column_right_edge = main_boundary
+            right_column_left_edge = main_boundary
+            
+            # Ensure columns don't extend beyond adaptive margins
+            left_column_left_edge = adaptive_left_margin
+            right_column_right_edge = adaptive_right_margin
+            
+            # Get Y bounds from body text
+            all_body_y = [r.y0 for r in body_text_spans] + [r.y1 for r in body_text_spans]
+            
+            if all_body_y:
+                text_top = min(all_body_y) - 10
+                text_bottom = max(all_body_y) + 10
+                
+                # Left column box - adaptive to this page
+                if left_column_left_edge < left_column_right_edge:
+                    left_column_box = fitz.Rect(
+                        left_column_left_edge,
+                        text_top,
+                        left_column_right_edge,
+                        text_bottom
+                    )
+                    page.draw_rect(left_column_box, color=(0, 0.7, 0), width=2)
+                
+                # Right column box - adaptive to this page
+                if right_column_left_edge < right_column_right_edge:
+                    right_column_box = fitz.Rect(
+                        right_column_left_edge,
+                        text_top,
+                        right_column_right_edge,
+                        text_bottom
+                    )
+                    page.draw_rect(right_column_box, color=(0, 0.7, 0), width=2)
     
     # Add summary pages for document-level issues and overall report
     if document_issues or report_summary:
