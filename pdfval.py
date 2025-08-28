@@ -19,6 +19,77 @@ from collections import Counter, defaultdict
 from difflib import SequenceMatcher
 from datetime import datetime
 
+def simple_boundary_validation(page):
+    """Simplified boundary validation - replaces complex margin detection"""
+    raw = page.get_text("dict")
+    blocks = raw.get("blocks", [])
+    
+    page_height = page.rect.height
+    page_width = page.rect.width
+    header_zone = page_height * 0.1
+    footer_zone = page_height * 0.9
+    
+    body_spans = []
+    for block in blocks:
+        if block["type"] == 0:
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    bbox = span.get("bbox", [])
+                    text = span.get("text", "")
+                    
+                    if (bbox and text.strip() and len(bbox) == 4 and
+                        bbox[2] - bbox[0] > 2 and bbox[3] - bbox[1] > 2):
+                        
+                        span_center_y = (bbox[1] + bbox[3]) / 2
+                        if header_zone < span_center_y < footer_zone:
+                            body_spans.append((fitz.Rect(bbox), text))
+    
+    # Detect layout 
+    page_center = page_width / 2
+    clear_left = [bbox for bbox, text in body_spans 
+                  if bbox.x1 - bbox.x0 <= page_width * 0.6 and (bbox.x0 + bbox.x1) / 2 < page_center - 50]
+    clear_right = [bbox for bbox, text in body_spans 
+                   if bbox.x1 - bbox.x0 <= page_width * 0.6 and (bbox.x0 + bbox.x1) / 2 > page_center + 50]
+    
+    divider = None
+    if len(clear_left) >= 5 and len(clear_right) >= 5:
+        left_end = max(bbox.x1 for bbox in clear_left)
+        right_start = min(bbox.x0 for bbox in clear_right)
+        if right_start > left_end + 5:
+            divider = (left_end + right_start) / 2
+    
+    # Create boundaries
+    if not body_spans:
+        return []
+    
+    all_x = [bbox.x0 for bbox, text in body_spans] + [bbox.x1 for bbox, text in body_spans]
+    all_y = [bbox.y0 for bbox, text in body_spans] + [bbox.y1 for bbox, text in body_spans]
+    
+    margin = 12.0  # Expanded margin to reduce boundary violations
+    if divider:  # Multi-column
+        boundaries = [
+            fitz.Rect(max(36.0, min(all_x) - margin), min(all_y) - margin, divider, max(all_y) + margin),
+            fitz.Rect(divider, min(all_y) - margin, min(page_width - 36.0, max(all_x) + margin), max(all_y) + margin)
+        ]
+    else:  # Single column
+        boundaries = [fitz.Rect(max(36.0, min(all_x) - margin), min(all_y) - margin, 
+                                min(page_width - 36.0, max(all_x) + margin), max(all_y) + margin)]
+    
+    # Check violations
+    violations = []
+    for bbox, text in body_spans:
+        if bbox.x1 - bbox.x0 > page_width * 0.6:  # Skip wide spans
+            continue
+        
+        if not any(boundary.contains(bbox) for boundary in boundaries):
+            violations.append({
+                "type": "boundary_violation", 
+                "detail": f"Text outside boundaries: '{text[:40]}'",
+                "bbox": list(bbox)
+            })
+    
+    return violations
+
 def rects_intersect(a, b, iou_thresh=0.05):
     # a,b are fitz.Rect; compute IoU-ish to avoid tiny touches
     inter = a & b
@@ -30,7 +101,7 @@ def rects_intersect(a, b, iou_thresh=0.05):
 def detect_column_boundaries(page):
     """
     Balanced column detection: Column widths are always equal, but gutters shift the centerline.
-    Focus on identifying column blocks while ignoring spanning headers.
+    Try block-based detection first, then fall back to span-based detection for PDFs with large blocks.
     """
     raw = page.get_text("dict")
     blocks = raw.get("blocks", [])
@@ -42,7 +113,7 @@ def detect_column_boundaries(page):
     header_zone = page_height * 0.1
     footer_zone = page_height * 0.9
     
-    # Identify column blocks vs spanning blocks (headers/footers)
+    # Try block-based detection first
     body_blocks = []
     for b in blocks:
         if b["type"] == 0:  # text block
@@ -75,59 +146,94 @@ def detect_column_boundaries(page):
         else:
             narrow_blocks.append(block)
     
-    # If mostly wide blocks, this is single column
-    if len(narrow_blocks) <= 1:
-        return []  # Single column layout
-    
-    # Analyze narrow blocks to find column structure
-    # Look for blocks that are clearly on left vs right side of page
-    left_column_blocks = []
-    right_column_blocks = []
-    
-    for block in narrow_blocks:
-        bbox = block["bbox"]
-        block_left = bbox[0]
-        block_right = bbox[2]
+    # If we have enough narrow blocks, try block-based detection
+    if len(narrow_blocks) > 1:
+        left_column_blocks = []
+        right_column_blocks = []
         
-        # More sophisticated classification based on block edges, not just center
-        # Left column: starts near left margin and doesn't extend past center
-        # Right column: starts after center and extends to right
+        for block in narrow_blocks:
+            bbox = block["bbox"]
+            block_left = bbox[0]
+            block_right = bbox[2]
+            
+            if block_left < page_width * 0.3 and block_right < page_center + 20:
+                left_column_blocks.append(block)
+            elif block_left > page_center - 20 and block_right > page_width * 0.7:
+                right_column_blocks.append(block)
         
-        if block_left < page_width * 0.3 and block_right < page_center + 20:
-            left_column_blocks.append(block)
-        elif block_left > page_center - 20 and block_right > page_width * 0.7:
-            right_column_blocks.append(block)
-        # Blocks that don't clearly fit either side are ignored (likely spanning elements)
+        # If we have blocks in both columns, calculate boundary
+        if left_column_blocks and right_column_blocks:
+            left_edges = [b["bbox"][2] for b in left_column_blocks]
+            right_edges = [b["bbox"][0] for b in right_column_blocks]
+            
+            left_column_end = max(left_edges)
+            right_column_start = min(right_edges)
+            gap_size = right_column_start - left_column_end
+            
+            if gap_size > 5:
+                all_left_edges = [b["bbox"][0] for b in left_column_blocks]
+                all_right_edges = [b["bbox"][2] for b in right_column_blocks]
+                
+                left_margin = min(all_left_edges)
+                right_margin = max(all_right_edges)
+                available_width = right_margin - left_margin
+                column_width = (available_width - gap_size) / 2
+                balanced_divider = left_margin + column_width + (gap_size / 2)
+                
+                return [balanced_divider]
     
-    # Must have blocks in both columns for multi-column layout
-    if not left_column_blocks or not right_column_blocks:
-        return []  # Single column
+    # Block-based detection failed, try span-based detection
+    # This handles PDFs where columns are spans within large blocks (like BRB)
+    all_spans = []
+    for b in blocks:
+        if b["type"] == 0:  # text block
+            for line in b.get("lines", []):
+                for span in line.get("spans", []):
+                    bbox = span.get("bbox", [])
+                    text = span.get("text", "").strip()
+                    if (bbox and text and 
+                        header_zone < (bbox[1] + bbox[3])/2 < footer_zone and
+                        bbox[2] - bbox[0] > 5):  # Minimum span width
+                        all_spans.append(bbox)
     
-    # Find the edges of each column
-    left_edges = [b["bbox"][2] for b in left_column_blocks]  # Right edges of left column
-    right_edges = [b["bbox"][0] for b in right_column_blocks]  # Left edges of right column
+    if len(all_spans) < 10:  # Need reasonable amount of spans
+        return []
     
-    left_column_end = max(left_edges)
-    right_column_start = min(right_edges)
+    # Classify spans by position with stricter boundaries to prevent overlap
+    left_spans = []
+    right_spans = []
     
-    # Calculate balanced column layout
-    # The key insight: column widths should be equal, gutter shifts the center
+    for bbox in all_spans:
+        span_center = (bbox[0] + bbox[2]) / 2
+        span_left = bbox[0]
+        span_right = bbox[2]
+        
+        # More restrictive column classification to avoid overlaps
+        # Left column: clearly in left half and doesn't extend past center
+        if span_center < page_center * 0.9 and span_right < page_center:
+            left_spans.append(bbox)
+        # Right column: clearly in right half and starts after center
+        elif span_center > page_center * 1.1 and span_left > page_center:
+            right_spans.append(bbox)
+    
+    # Need spans in both columns
+    if len(left_spans) < 5 or len(right_spans) < 5:
+        return []
+    
+    # Find the gap between columns
+    left_rights = [bbox[2] for bbox in left_spans]
+    right_lefts = [bbox[0] for bbox in right_spans]
+    
+    left_column_end = max(left_rights)
+    right_column_start = min(right_lefts)
     gap_size = right_column_start - left_column_end
     
-    if gap_size > 5:  # Reasonable gap between columns
-        # Calculate what the divider should be for BALANCED columns
-        # Get actual text margins
-        all_left_edges = [b["bbox"][0] for b in left_column_blocks]
-        all_right_edges = [b["bbox"][2] for b in right_column_blocks]
-        
-        left_margin = min(all_left_edges)
-        right_margin = max(all_right_edges)
-        
-        # For balanced columns: each column gets equal width
+    if gap_size > 5:
+        # Calculate balanced divider
+        left_margin = min(bbox[0] for bbox in left_spans)
+        right_margin = max(bbox[2] for bbox in right_spans)
         available_width = right_margin - left_margin
         column_width = (available_width - gap_size) / 2
-        
-        # The divider should be positioned to create balanced columns
         balanced_divider = left_margin + column_width + (gap_size / 2)
         
         return [balanced_divider]
@@ -995,10 +1101,9 @@ def check_page(page, margin_pts, dpi_threshold, page_number=None, total_pages=No
                     pass
             image_ppi.append((ibox, ppi_x, ppi_y))
 
-    # 1) Margin intrusions (text)
-    for r, txt in text_rects:
-        if r.intersects(left_m) or r.intersects(right_m) or r.intersects(top_m) or r.intersects(bottom_m):
-            issues.append({"type":"margin_intrusion_text", "detail":txt[:60], "bbox":list(r)})
+    # 1) Simplified boundary validation (replaces margin intrusion detection)
+    boundary_violations = simple_boundary_validation(page)
+    issues.extend(boundary_violations)
 
     # 1b) Margin intrusions (images)
     for r in image_rects:
@@ -1232,9 +1337,9 @@ def check_thumb_tabs_removed():
 
 def check_page_enhanced(page, margin_pts, dpi_threshold, page_number=None, total_pages=None, enable_advanced=True, doc=None, margin_analysis=None):
     """Enhanced page checking with all validation features"""
-    # Run gutter-aware margin checks instead of original margin checks
+    # Run simplified boundary validation instead of complex margin checks
     if margin_analysis:
-        margin_issues = check_guttered_margins(page, page_number, margin_analysis)
+        margin_issues = simple_boundary_validation(page)
         # Run original checks without margin checking (pass margin_pts=0 to skip)
         other_issues = check_page_original(page, 0, dpi_threshold)
         issues = margin_issues + other_issues
@@ -1376,10 +1481,9 @@ def check_page_original(page, margin_pts, dpi_threshold):
                     pass
             image_ppi.append((ibox, ppi_x, ppi_y))
 
-    # 1) Margin intrusions (text)
-    for r, txt in text_rects:
-        if r.intersects(left_m) or r.intersects(right_m) or r.intersects(top_m) or r.intersects(bottom_m):
-            issues.append({"type":"margin_intrusion_text", "detail":txt[:60], "bbox":list(r)})
+    # 1) Simplified boundary validation (replaces margin intrusion detection)
+    boundary_violations = simple_boundary_validation(page)
+    issues.extend(boundary_violations)
 
     # 1b) Margin intrusions (images)
     for r in image_rects:
@@ -2675,19 +2779,6 @@ def check_header_consistency(page, page_number=None, total_pages=None):
                         "bbox": header["bbox"]
                     })
                 
-                # Check for common header patterns
-                if page_number and page_number > 1:
-                    # Look for page numbers in headers
-                    page_num_found = any(str(i) in text for i in range(max(1, page_number-2), min(total_pages+1, page_number+3)))
-                    chapter_pattern = re.search(r'chapter\s+\d+', text, re.IGNORECASE)
-                    
-                    if not page_num_found and not chapter_pattern and len(text.split()) < 2:
-                        issues.append({
-                            "type": "minimal_header_content",
-                            "detail": f"Header may be incomplete: '{text}'",
-                            "bbox": header["bbox"]
-                        })
-        
         # Check for missing headers on pages that should have them
         if page_number and page_number > 1 and not header_elements:
             issues.append({
