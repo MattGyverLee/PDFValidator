@@ -12,11 +12,12 @@ Usage:
   python verify_pdf.py input.pdf --margin-pts 36 --dpi-threshold 300 --annotate out_annotated.pdf --json out_report.json
 """
 
-import json, math, argparse, sys, re
+import json, math, argparse, sys, re, os, glob
 import fitz  # PyMuPDF
 import numpy as np
 from collections import Counter, defaultdict
 from difflib import SequenceMatcher
+from datetime import datetime
 
 def rects_intersect(a, b, iou_thresh=0.05):
     # a,b are fitz.Rect; compute IoU-ish to avoid tiny touches
@@ -25,6 +26,450 @@ def rects_intersect(a, b, iou_thresh=0.05):
     inter_area = inter.get_area()
     union_area = a.get_area() + b.get_area() - inter_area
     return (inter_area / union_area) >= iou_thresh
+
+def detect_column_boundaries(page):
+    """
+    Analyze page to detect column boundaries for better overlap detection
+    """
+    raw = page.get_text("rawdict")
+    blocks = raw.get("blocks", [])
+    
+    # Collect all text x-positions to find natural column breaks
+    x_positions = []
+    for b in blocks:
+        if b["type"] == 0:  # text block
+            for line in b.get("lines", []):
+                for span in line.get("spans", []):
+                    bbox = span.get("bbox", [])
+                    if bbox and span.get("text", "").strip():  # Only actual text
+                        x_positions.extend([bbox[0], bbox[2]])  # left and right edges
+    
+    if not x_positions:
+        # Fallback: assume standard 2-column layout
+        page_width = page.rect.width
+        return [page_width / 2]
+    
+    x_positions.sort()
+    page_width = page.rect.width
+    
+    # Find natural gaps in text positioning (likely column boundaries)
+    gaps = []
+    gap_threshold = 20  # Points - minimum gap to consider a column boundary
+    
+    for i in range(1, len(x_positions)):
+        gap = x_positions[i] - x_positions[i-1]
+        if gap > gap_threshold:
+            gap_center = (x_positions[i-1] + x_positions[i]) / 2
+            if page_width * 0.2 < gap_center < page_width * 0.8:  # Must be reasonable position
+                gaps.append(gap_center)
+    
+    # Return the most likely column boundaries (remove duplicates)
+    column_boundaries = []
+    for gap in gaps:
+        if not any(abs(gap - existing) < 30 for existing in column_boundaries):
+            column_boundaries.append(gap)
+    
+    return sorted(column_boundaries) if column_boundaries else [page_width / 2]
+
+def text_spans_actually_overlap(rect1, text1, rect2, text2, column_boundaries=None):
+    """
+    Refined text overlap detection:
+    - Horizontal overlap: Always problematic (especially cross-column)
+    - Vertical overlap: Only when actual text areas touch (not just headroom)
+    """
+    # First check if bounding boxes intersect at all
+    inter = rect1 & rect2
+    if inter.is_empty:
+        return False
+    
+    # Skip identical non-empty text (repeated headers, page numbers)
+    if text1.strip() == text2.strip() and text1.strip():
+        return False
+    
+    # Skip if one text is completely contained in the other (OCR artifacts)
+    text1_clean = text1.strip().lower()
+    text2_clean = text2.strip().lower()
+    if text1_clean and text2_clean:
+        if text1_clean in text2_clean or text2_clean in text1_clean:
+            return False
+    
+    # Calculate intersection dimensions
+    inter_width = inter.x1 - inter.x0
+    inter_height = inter.y1 - inter.y0
+    
+    # HORIZONTAL OVERLAP DETECTION (high priority - always problematic)
+    if inter_width > 0.5:  # Any meaningful horizontal overlap
+        # Check if this is cross-column overlap (more serious)
+        center_x1 = (rect1.x0 + rect1.x1) / 2
+        center_x2 = (rect2.x0 + rect2.x1) / 2
+        
+        if column_boundaries:
+            # Determine which column each text is in
+            col1 = 0
+            col2 = 0
+            for boundary in column_boundaries:
+                if center_x1 > boundary:
+                    col1 += 1
+                if center_x2 > boundary:
+                    col2 += 1
+            
+            # Cross-column overlap is always flagged
+            if col1 != col2:
+                return True
+            
+            # Same-column overlap - check if it's extending into margins or other columns
+            if inter_width > 5.0:  # Significant same-column overlap
+                return True
+        else:
+            # No column info - flag significant horizontal overlaps
+            if inter_width > 2.0:
+                return True
+    
+    # VERTICAL OVERLAP DETECTION - only flag when text actually touches
+    if inter_height > 1.0:  # Some vertical overlap exists
+        # Handle empty spans differently - they might be structural elements
+        text1_empty = not text1.strip()
+        text2_empty = not text2.strip()
+        
+        # If both are empty, only flag if boxes are substantial (not artifacts)
+        if text1_empty and text2_empty:
+            area1 = (rect1.x1 - rect1.x0) * (rect1.y1 - rect1.y0)
+            area2 = (rect2.x1 - rect2.x0) * (rect2.y1 - rect2.y0)
+            
+            # Skip tiny empty boxes
+            if area1 < 20 or area2 < 20:
+                return False
+            
+            # For structural elements, be more lenient with vertical overlap
+            # Only flag if there's also significant horizontal overlap
+            if inter_width > 3.0:
+                return True
+            return False
+        
+        # For text content, estimate actual text positions within boxes
+        box1_height = rect1.y1 - rect1.y0
+        box2_height = rect2.y1 - rect2.y0
+        
+        # More conservative text area estimation
+        # Assume text occupies middle 60% of box height (40% is headroom/leading)
+        text_ratio = 0.6
+        headroom_ratio = (1.0 - text_ratio) / 2  # 20% top and bottom
+        
+        # Calculate estimated text bounds
+        text1_top = rect1.y0 + (box1_height * headroom_ratio)
+        text1_bottom = rect1.y1 - (box1_height * headroom_ratio)
+        
+        text2_top = rect2.y0 + (box2_height * headroom_ratio)
+        text2_bottom = rect2.y1 - (box2_height * headroom_ratio)
+        
+        # Check if estimated text areas actually overlap
+        text_overlap_top = max(text1_top, text2_top)
+        text_overlap_bottom = min(text1_bottom, text2_bottom)
+        
+        if text_overlap_bottom > text_overlap_top:
+            # There is estimated text-to-text overlap
+            text_overlap_height = text_overlap_bottom - text_overlap_top
+            
+            # Only flag if overlap is substantial enough to affect legibility
+            min_problematic_overlap = 1.5  # Points
+            if text_overlap_height > min_problematic_overlap:
+                return True
+    
+    return False
+
+def identify_problematic_line(rect1, text1, rect2, text2, column_boundaries):
+    """
+    Identify text boxes that cross the column boundary (gutter space).
+    NO text should cross the vertical line between columns.
+    Returns: 0 for rect1, 1 for rect2, None if neither crosses boundary
+    """
+    if not column_boundaries:
+        return None
+    
+    main_boundary = column_boundaries[0]
+    
+    # Check if either text box crosses the column boundary
+    # Left column text should not extend past boundary
+    # Right column text should not extend before boundary
+    
+    crosses_boundary_1 = rect1.x0 < main_boundary < rect1.x1
+    crosses_boundary_2 = rect2.x0 < main_boundary < rect2.x1
+    
+    # If both cross, return the one that crosses more severely
+    if crosses_boundary_1 and crosses_boundary_2:
+        # Calculate how much each crosses
+        cross_amount_1 = min(rect1.x1 - main_boundary, main_boundary - rect1.x0)
+        cross_amount_2 = min(rect2.x1 - main_boundary, main_boundary - rect2.x0)
+        return 0 if cross_amount_1 > cross_amount_2 else 1
+    
+    # Return whichever one crosses the boundary
+    if crosses_boundary_1:
+        return 0
+    elif crosses_boundary_2:
+        return 1
+    
+    # If neither crosses the boundary, determine column assignment
+    center_x1 = (rect1.x0 + rect1.x1) / 2
+    center_x2 = (rect2.x0 + rect2.x1) / 2
+    
+    col1 = 0 if center_x1 < main_boundary else 1
+    col2 = 0 if center_x2 < main_boundary else 1
+    
+    # If they're in the same column, flag the one extending further toward boundary
+    if col1 == col2:
+        if col1 == 0:  # Both in left column
+            # Flag the one extending closer to the boundary
+            if rect1.x1 > rect2.x1:
+                return 0
+            else:
+                return 1
+        else:  # Both in right column
+            # Flag the one extending closer to the boundary  
+            if rect1.x0 < rect2.x0:
+                return 0
+            else:
+                return 1
+    
+    return None
+
+def analyze_gutter_margins(doc, min_margin_pts=36.0):
+    """
+    Analyze document to determine if it uses guttered margins for book binding.
+    Returns margin info for proper validation of book layouts.
+    """
+    margin_analysis = {
+        "uses_gutters": False,
+        "odd_page_margins": {},  # left, right, top, bottom
+        "even_page_margins": {},
+        "consistent_margins": {},  # for non-guttered layouts
+        "margin_issues": []
+    }
+    
+    if len(doc) < 2:
+        # Single page - assume consistent margins
+        page = doc[0]
+        pr = page.rect
+        margin_analysis["consistent_margins"] = {
+            "left": min_margin_pts,
+            "right": min_margin_pts, 
+            "top": min_margin_pts,
+            "bottom": min_margin_pts
+        }
+        return margin_analysis
+    
+    # Sample first few pages to detect margin pattern
+    sample_pages = min(6, len(doc))
+    odd_left_margins = []
+    odd_right_margins = []
+    even_left_margins = []
+    even_right_margins = []
+    
+    for page_idx in range(sample_pages):
+        page = doc[page_idx]
+        page_num = page_idx + 1  # 1-based page numbering
+        
+        # Get text blocks to estimate actual margins
+        raw = page.get_text("rawdict")
+        blocks = raw.get("blocks", [])
+        
+        if not blocks:
+            continue
+            
+        # Find leftmost and rightmost text positions
+        left_positions = []
+        right_positions = []
+        
+        for block in blocks:
+            if block["type"] == 0:  # text block
+                bbox = block["bbox"]
+                left_positions.append(bbox[0])
+                right_positions.append(bbox[2])
+        
+        if not left_positions or not right_positions:
+            continue
+            
+        # Estimate margins based on text placement
+        page_width = page.rect.width
+        left_margin = max(0, min(left_positions)) if left_positions else min_margin_pts
+        right_margin = max(0, page_width - max(right_positions)) if right_positions else min_margin_pts
+        
+        if page_num % 2 == 1:  # Odd page
+            odd_left_margins.append(left_margin)
+            odd_right_margins.append(right_margin)
+        else:  # Even page
+            even_left_margins.append(left_margin)
+            even_right_margins.append(right_margin)
+    
+    # Analyze margin patterns
+    if odd_left_margins and odd_right_margins and even_left_margins and even_right_margins:
+        avg_odd_left = sum(odd_left_margins) / len(odd_left_margins)
+        avg_odd_right = sum(odd_right_margins) / len(odd_right_margins)
+        avg_even_left = sum(even_left_margins) / len(even_left_margins)
+        avg_even_right = sum(even_right_margins) / len(even_right_margins)
+        
+        # Check if margins are mirrored (gutter pattern)
+        # Odd pages: left=gutter (larger), right=outer (smaller)
+        # Even pages: left=outer (smaller), right=gutter (larger)
+        gutter_threshold = 10.0  # Points difference to consider guttered
+        
+        odd_left_larger = avg_odd_left - avg_odd_right > gutter_threshold
+        even_right_larger = avg_even_right - avg_even_left > gutter_threshold
+        
+        if odd_left_larger and even_right_larger:
+            # Detected gutter pattern
+            margin_analysis["uses_gutters"] = True
+            margin_analysis["odd_page_margins"] = {
+                "left": avg_odd_left,    # gutter (inner)
+                "right": avg_odd_right,  # outer
+                "top": min_margin_pts,   # assume standard
+                "bottom": min_margin_pts
+            }
+            margin_analysis["even_page_margins"] = {
+                "left": avg_even_left,   # outer  
+                "right": avg_even_right, # gutter (inner)
+                "top": min_margin_pts,
+                "bottom": min_margin_pts
+            }
+        else:
+            # No gutter pattern detected - use consistent margins
+            avg_left = max(min_margin_pts * 0.5, (avg_odd_left + avg_even_left) / 2)
+            avg_right = max(min_margin_pts * 0.5, (avg_odd_right + avg_even_right) / 2)
+            margin_analysis["consistent_margins"] = {
+                "left": avg_left,
+                "right": avg_right,
+                "top": min_margin_pts,
+                "bottom": min_margin_pts
+            }
+    
+    # If no margin data was collected, use reasonable defaults
+    if not margin_analysis.get("uses_gutters") and not margin_analysis.get("consistent_margins"):
+        margin_analysis["consistent_margins"] = {
+            "left": min_margin_pts * 0.75,
+            "right": min_margin_pts * 0.75,
+            "top": min_margin_pts * 0.75,
+            "bottom": min_margin_pts * 0.75
+        }
+    
+    return margin_analysis
+
+def check_guttered_margins(page, page_number, margin_analysis, min_acceptable_margin=18.0):
+    """
+    Check margins with awareness of gutter layouts for book binding
+    """
+    issues = []
+    pr = page.rect
+    page_num = page_number  # 1-based
+    
+    # Determine expected margins based on analysis
+    if margin_analysis["uses_gutters"]:
+        if page_num % 2 == 1:  # Odd page
+            expected_margins = margin_analysis["odd_page_margins"]
+        else:  # Even page  
+            expected_margins = margin_analysis["even_page_margins"]
+    else:
+        expected_margins = margin_analysis["consistent_margins"]
+    
+    if not expected_margins:
+        # Fallback to default margins
+        expected_margins = {"left": 36.0, "right": 36.0, "top": 36.0, "bottom": 36.0}
+    
+    # Check if overall margins are too small (report once per page)
+    min_margin = min(expected_margins.values())
+    if min_margin < min_acceptable_margin:
+        issues.append({
+            "type": "insufficient_margins",
+            "detail": f"Page {page_num}: Margins too small (minimum: {min_margin:.1f}pt, required: {min_acceptable_margin}pt)"
+        })
+    
+    # Create margin zones using expected margins
+    left_margin_zone = fitz.Rect(pr.x0, pr.y0, pr.x0 + expected_margins["left"], pr.y1)
+    right_margin_zone = fitz.Rect(pr.x1 - expected_margins["right"], pr.y0, pr.x1, pr.y1)
+    top_margin_zone = fitz.Rect(pr.x0, pr.y0, pr.x1, pr.y0 + expected_margins["top"])
+    bottom_margin_zone = fitz.Rect(pr.x0, pr.y1 - expected_margins["bottom"], pr.x1, pr.y1)
+    
+    # Get text and image elements
+    raw = page.get_text("rawdict")
+    blocks = raw.get("blocks", [])
+    
+    text_rects = []
+    image_rects = []
+    
+    for b in blocks:
+        if b["type"] == 0:  # text block
+            for line in b.get("lines", []):
+                for span in line.get("spans", []):
+                    bbox = fitz.Rect(span["bbox"])
+                    text_rects.append((bbox, span.get("text", "")))
+        elif b["type"] == 1:  # image block
+            ibox = fitz.Rect(b["bbox"])
+            image_rects.append(ibox)
+    
+    # Check for unusual intrusions (not just any intrusion)
+    intrusion_threshold = 5.0  # Points - only flag significant intrusions
+    
+    for rect, text in text_rects:
+        # Check each margin zone
+        margin_intrusions = []
+        
+        if rect.intersects(left_margin_zone):
+            intrusion_depth = max(0, rect.x1 - left_margin_zone.x1)
+            if intrusion_depth > intrusion_threshold:
+                margin_intrusions.append(f"left margin by {intrusion_depth:.1f}pt")
+        
+        if rect.intersects(right_margin_zone):
+            intrusion_depth = max(0, right_margin_zone.x0 - rect.x0) 
+            if intrusion_depth > intrusion_threshold:
+                margin_intrusions.append(f"right margin by {intrusion_depth:.1f}pt")
+                
+        if rect.intersects(top_margin_zone):
+            intrusion_depth = max(0, rect.y1 - top_margin_zone.y1)
+            if intrusion_depth > intrusion_threshold:
+                margin_intrusions.append(f"top margin by {intrusion_depth:.1f}pt")
+                
+        if rect.intersects(bottom_margin_zone):
+            intrusion_depth = max(0, bottom_margin_zone.y0 - rect.y0)
+            if intrusion_depth > intrusion_threshold:
+                margin_intrusions.append(f"bottom margin by {intrusion_depth:.1f}pt")
+        
+        if margin_intrusions:
+            issues.append({
+                "type": "margin_intrusion_text",
+                "detail": f"Text '{text[:50]}' intrudes into {', '.join(margin_intrusions)}",
+                "bbox": list(rect)
+            })
+    
+    # Check image intrusions  
+    for rect in image_rects:
+        margin_intrusions = []
+        
+        if rect.intersects(left_margin_zone):
+            intrusion_depth = max(0, rect.x1 - left_margin_zone.x1)
+            if intrusion_depth > intrusion_threshold:
+                margin_intrusions.append(f"left margin by {intrusion_depth:.1f}pt")
+                
+        if rect.intersects(right_margin_zone):
+            intrusion_depth = max(0, right_margin_zone.x0 - rect.x0)
+            if intrusion_depth > intrusion_threshold:
+                margin_intrusions.append(f"right margin by {intrusion_depth:.1f}pt")
+                
+        if rect.intersects(top_margin_zone):
+            intrusion_depth = max(0, rect.y1 - top_margin_zone.y1)
+            if intrusion_depth > intrusion_threshold:
+                margin_intrusions.append(f"top margin by {intrusion_depth:.1f}pt")
+                
+        if rect.intersects(bottom_margin_zone):
+            intrusion_depth = max(0, bottom_margin_zone.y0 - rect.y0)
+            if intrusion_depth > intrusion_threshold:
+                margin_intrusions.append(f"bottom margin by {intrusion_depth:.1f}pt")
+        
+        if margin_intrusions:
+            issues.append({
+                "type": "margin_intrusion_image", 
+                "detail": f"Image intrudes into {', '.join(margin_intrusions)}",
+                "bbox": list(rect)
+            })
+    
+    return issues
 
 def px_per_inch_from_matrix(img_matrix):
     # MuPDF stores image transform; extract scale if available
@@ -378,16 +823,48 @@ def check_page(page, margin_pts, dpi_threshold, page_number=None, total_pages=No
         if r.intersects(left_m) or r.intersects(right_m) or r.intersects(top_m) or r.intersects(bottom_m):
             issues.append({"type":"margin_intrusion_image", "bbox":list(r)})
 
-    # 2) Text overlap (span-over-span IoU)
+    # 2) Text overlap detection - identify problematic lines only
+    # Detect column boundaries for better overlap analysis
+    column_boundaries = detect_column_boundaries(page)
+    
+    # Find lines that extend beyond their proper boundaries
+    problematic_lines = set()  # Track which lines are the culprits
+    
     # O(n^2) over spans per page; typically fine. For big pages, you can grid-index.
     for i in range(len(text_rects)):
         ri, ti = text_rects[i]
         for j in range(i+1, len(text_rects)):
             rj, tj = text_rects[j]
-            if rects_intersect(ri, rj, iou_thresh=0.08):
-                # Ignore identical boxes with identical text (could be ligature splits).
-                if not (ri == rj and ti == tj):
-                    issues.append({"type":"overlap_text_text", "detail": f"{ti[:30]} | {tj[:30]}", "bboxes":[list(ri), list(rj)]})
+            # Check if these spans overlap
+            if text_spans_actually_overlap(ri, ti, rj, tj, column_boundaries):
+                # Determine which line is the problematic one (extends too far)
+                culprit_idx = identify_problematic_line(ri, ti, rj, tj, column_boundaries)
+                if culprit_idx is not None:
+                    # Mark the problematic line
+                    actual_idx = i if culprit_idx == 0 else j
+                    problematic_lines.add(actual_idx)
+    
+    # Report only lines that actually cross the column boundary
+    main_boundary = column_boundaries[0] if column_boundaries else None
+    if main_boundary:
+        for idx in problematic_lines:
+            ri, ti = text_rects[idx]
+            # Double-check that this line actually crosses the boundary
+            if ri.x0 < main_boundary < ri.x1:
+                issues.append({
+                    "type": "text_crosses_column_boundary", 
+                    "detail": f"Text crosses column separator at {main_boundary:.1f}pt: '{ti[:50]}'",
+                    "bbox": list(ri)
+                })
+    else:
+        # Fallback if no boundary detected
+        for idx in problematic_lines:
+            ri, ti = text_rects[idx]
+            issues.append({
+                "type": "text_crosses_column_boundary", 
+                "detail": f"Text crosses column separator: '{ti[:50]}'",
+                "bbox": list(ri)
+            })
 
     # 3) Text over image overlap
     for rtxt, txt in text_rects:
@@ -571,10 +1048,17 @@ def check_thumb_tabs_removed():
     
     return issues
 
-def check_page_enhanced(page, margin_pts, dpi_threshold, page_number=None, total_pages=None, enable_advanced=True, doc=None):
+def check_page_enhanced(page, margin_pts, dpi_threshold, page_number=None, total_pages=None, enable_advanced=True, doc=None, margin_analysis=None):
     """Enhanced page checking with all validation features"""
-    # Run original checks
-    issues = check_page_original(page, margin_pts, dpi_threshold)
+    # Run gutter-aware margin checks instead of original margin checks
+    if margin_analysis:
+        margin_issues = check_guttered_margins(page, page_number, margin_analysis)
+        # Run original checks without margin checking (pass margin_pts=0 to skip)
+        other_issues = check_page_original(page, 0, dpi_threshold)
+        issues = margin_issues + other_issues
+    else:
+        # Fallback to original checks if no margin analysis
+        issues = check_page_original(page, margin_pts, dpi_threshold)
     
     # Add new advanced checks if enabled
     if enable_advanced:
@@ -674,16 +1158,48 @@ def check_page_original(page, margin_pts, dpi_threshold):
         if r.intersects(left_m) or r.intersects(right_m) or r.intersects(top_m) or r.intersects(bottom_m):
             issues.append({"type":"margin_intrusion_image", "bbox":list(r)})
 
-    # 2) Text overlap (span-over-span IoU)
+    # 2) Text overlap detection - identify problematic lines only
+    # Detect column boundaries for better overlap analysis
+    column_boundaries = detect_column_boundaries(page)
+    
+    # Find lines that extend beyond their proper boundaries
+    problematic_lines = set()  # Track which lines are the culprits
+    
     # O(n^2) over spans per page; typically fine. For big pages, you can grid-index.
     for i in range(len(text_rects)):
         ri, ti = text_rects[i]
         for j in range(i+1, len(text_rects)):
             rj, tj = text_rects[j]
-            if rects_intersect(ri, rj, iou_thresh=0.08):
-                # Ignore identical boxes with identical text (could be ligature splits).
-                if not (ri == rj and ti == tj):
-                    issues.append({"type":"overlap_text_text", "detail": f"{ti[:30]} | {tj[:30]}", "bboxes":[list(ri), list(rj)]})
+            # Check if these spans overlap
+            if text_spans_actually_overlap(ri, ti, rj, tj, column_boundaries):
+                # Determine which line is the problematic one (extends too far)
+                culprit_idx = identify_problematic_line(ri, ti, rj, tj, column_boundaries)
+                if culprit_idx is not None:
+                    # Mark the problematic line
+                    actual_idx = i if culprit_idx == 0 else j
+                    problematic_lines.add(actual_idx)
+    
+    # Report only lines that actually cross the column boundary
+    main_boundary = column_boundaries[0] if column_boundaries else None
+    if main_boundary:
+        for idx in problematic_lines:
+            ri, ti = text_rects[idx]
+            # Double-check that this line actually crosses the boundary
+            if ri.x0 < main_boundary < ri.x1:
+                issues.append({
+                    "type": "text_crosses_column_boundary", 
+                    "detail": f"Text crosses column separator at {main_boundary:.1f}pt: '{ti[:50]}'",
+                    "bbox": list(ri)
+                })
+    else:
+        # Fallback if no boundary detected
+        for idx in problematic_lines:
+            ri, ti = text_rects[idx]
+            issues.append({
+                "type": "text_crosses_column_boundary", 
+                "detail": f"Text crosses column separator: '{ti[:50]}'",
+                "bbox": list(ri)
+            })
 
     # 3) Text over image overlap
     for rtxt, txt in text_rects:
@@ -718,9 +1234,9 @@ def check_page_original(page, margin_pts, dpi_threshold):
     return issues
 
 # Update check_page to use enhanced version
-def check_page(page, margin_pts, dpi_threshold, page_number=None, total_pages=None, enable_advanced=True, doc=None):
+def check_page(page, margin_pts, dpi_threshold, page_number=None, total_pages=None, enable_advanced=True, doc=None, margin_analysis=None):
     """Main page checking function with enhanced validation"""
-    return check_page_enhanced(page, margin_pts, dpi_threshold, page_number, total_pages, enable_advanced, doc)
+    return check_page_enhanced(page, margin_pts, dpi_threshold, page_number, total_pages, enable_advanced, doc, margin_analysis)
 
 def annotate_pdf(input_path, output_path, per_page_issues, document_issues=None, report_summary=None):
     """Enhanced PDF annotation with comprehensive issue highlighting and summary pages"""
@@ -731,7 +1247,9 @@ def annotate_pdf(input_path, output_path, per_page_issues, document_issues=None,
         # Original checks - Red family
         "margin_intrusion_text": (1,0,0),
         "margin_intrusion_image": (1,0,0),
+        "insufficient_margins": (0.8,0,0),
         "overlap_text_text": (0,0,1),
+        "text_crosses_column_boundary": (1,0,0.5),  # Red-purple for column boundary violations
         "overlap_text_image": (0.5,0,0.5),
         "low_dpi_image": (1,0.5,0),
         "dpi_unknown_image": (0.5,0.5,0.5),
@@ -1020,17 +1538,320 @@ Validation Status: {'✓ PASSED' if report_summary.get('ok', False) else '✗ IS
 
 def main():
     ap = argparse.ArgumentParser(description="Enhanced PDF Validator - Comprehensive print production validation")
-    ap.add_argument("pdf", help="Input PDF")
+    ap.add_argument("pdf", help="Input PDF file or directory containing PDFs")
     ap.add_argument("--margin-pts", type=float, default=36.0, help="Margin threshold in points (72pt = 1 inch)")
     ap.add_argument("--dpi-threshold", type=int, default=300, help="Min acceptable placed PPI for images")
-    ap.add_argument("--annotate", help="Write annotated PDF here")
-    ap.add_argument("--json", help="Write JSON report here")
+    ap.add_argument("--annotate", help="Write annotated PDF here (ignored in batch mode)")
+    ap.add_argument("--json", help="Write JSON report here (ignored in batch mode)")
     ap.add_argument("--basic-only", action="store_true", help="Run only basic checks (disable advanced validation)")
     ap.add_argument("--check-text-similarity", action="store_true", help="Enable text consistency checks between pages")
+    ap.add_argument("--batch", action="store_true", help="Batch mode: process all PDFs in specified directory")
+    ap.add_argument("--output-dir", default="output", help="Output directory for batch mode (default: output)")
+    ap.add_argument("--rating-summary", action="store_true", help="Generate rating summary ranking PDFs from worst to best (batch mode only)")
     args = ap.parse_args()
 
+    # Check if batch mode or single file mode
+    if args.batch or (os.path.isdir(args.pdf)):
+        return batch_process_pdfs(args)
+    else:
+        return process_single_pdf(args)
+
+def batch_process_pdfs(args):
+    """Process all PDFs in a directory with organized output structure"""
+    
+    input_dir = args.pdf if os.path.isdir(args.pdf) else "."
+    output_base = args.output_dir
+    
+    # Find all PDF files
+    pdf_pattern = os.path.join(input_dir, "*.pdf")
+    pdf_files = glob.glob(pdf_pattern)
+    
+    if not pdf_files:
+        print(f"No PDF files found in {input_dir}")
+        return 1
+    
+    # Create organized output structure
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    batch_dir = os.path.join(output_base, f"batch_{timestamp}")
+    reports_dir = os.path.join(batch_dir, "reports")
+    annotations_dir = os.path.join(batch_dir, "annotations")
+    summary_dir = os.path.join(batch_dir, "summary")
+    
+    os.makedirs(reports_dir, exist_ok=True)
+    os.makedirs(annotations_dir, exist_ok=True) 
+    os.makedirs(summary_dir, exist_ok=True)
+    
+    print(f"\n=== BATCH PDF VALIDATION ===")
+    print(f"Input directory: {input_dir}")
+    print(f"Output directory: {batch_dir}")
+    print(f"Found {len(pdf_files)} PDF files")
+    print(f"Mode: {'Basic' if args.basic_only else 'Advanced'} validation")
+    print("\nProcessing files...")
+    
+    batch_summary = {
+        "timestamp": timestamp,
+        "input_directory": input_dir,
+        "output_directory": batch_dir,
+        "total_files": len(pdf_files),
+        "processed_files": 0,
+        "failed_files": 0,
+        "total_issues": 0,
+        "files": []
+    }
+    
+    for i, pdf_path in enumerate(pdf_files, 1):
+        filename = os.path.basename(pdf_path)
+        base_name = os.path.splitext(filename)[0]
+        
+        print(f"\n[{i}/{len(pdf_files)}] Processing: {filename}")
+        
+        try:
+            # Process single PDF
+            single_args = type('Args', (), {
+                'pdf': pdf_path,
+                'margin_pts': args.margin_pts,
+                'dpi_threshold': args.dpi_threshold,
+                'basic_only': args.basic_only,
+                'check_text_similarity': args.check_text_similarity,
+                'json': os.path.join(reports_dir, f"{base_name}_report.json"),
+                'annotate': os.path.join(annotations_dir, f"{base_name}_annotated.pdf")
+            })()
+            
+            result = process_single_pdf(single_args, verbose=False)
+            
+            # Read the generated report for summary
+            if os.path.exists(single_args.json):
+                with open(single_args.json, 'r') as f:
+                    report_data = json.load(f)
+                    
+                file_summary = {
+                    "filename": filename,
+                    "status": "success",
+                    "total_issues": report_data.get("summary", {}).get("total_issues", 0),
+                    "pages": report_data.get("pages", 0),
+                    "pages_with_issues": report_data.get("summary", {}).get("pages_with_issues", 0),
+                    "ok": report_data.get("summary", {}).get("ok", False)
+                }
+                
+                batch_summary["total_issues"] += file_summary["total_issues"]
+                batch_summary["processed_files"] += 1
+                
+                # Print brief results
+                status_icon = "\u2713" if file_summary["ok"] else "\u26a0"
+                print(f"  {status_icon} {file_summary['total_issues']} issues found ({file_summary['pages']} pages)")
+                
+            else:
+                file_summary = {
+                    "filename": filename,
+                    "status": "error",
+                    "error": "Report file not generated"
+                }
+                batch_summary["failed_files"] += 1
+                print(f"  \u2717 Failed to generate report")
+                
+            batch_summary["files"].append(file_summary)
+            
+        except Exception as e:
+            print(f"  \u2717 Error: {str(e)}")
+            batch_summary["failed_files"] += 1
+            batch_summary["files"].append({
+                "filename": filename,
+                "status": "error",
+                "error": str(e)
+            })
+    
+    # Generate batch summary report
+    summary_file = os.path.join(summary_dir, "batch_summary.json")
+    with open(summary_file, 'w') as f:
+        json.dump(batch_summary, f, indent=2)
+    
+    # Generate batch summary text report  
+    summary_text_file = os.path.join(summary_dir, "batch_summary.txt")
+    generate_batch_summary_text(batch_summary, summary_text_file)
+    
+    # Generate rating summary if requested
+    if args.rating_summary:
+        rating_file = os.path.join(summary_dir, "rating_summary.txt")
+        generate_rating_summary(batch_summary, rating_file)
+        print(f"  Rating Summary: {summary_dir}/rating_summary.txt")
+    
+    # Final summary
+    print(f"\n=== BATCH PROCESSING COMPLETE ===")
+    print(f"Processed: {batch_summary['processed_files']}/{batch_summary['total_files']} files")
+    print(f"Failed: {batch_summary['failed_files']} files")
+    print(f"Total issues found: {batch_summary['total_issues']}")
+    print(f"\nResults saved to: {batch_dir}")
+    print(f"  Reports: {reports_dir}")
+    print(f"  Annotations: {annotations_dir}") 
+    print(f"  Summary: {summary_dir}")
+    
+    return 0 if batch_summary["failed_files"] == 0 else 1
+
+def generate_batch_summary_text(batch_summary, output_file):
+    """Generate human-readable batch summary report"""
+    with open(output_file, 'w') as f:
+        f.write("PDF VALIDATION BATCH REPORT\n")
+        f.write("=" * 50 + "\n\n")
+        f.write(f"Timestamp: {batch_summary['timestamp']}\n")
+        f.write(f"Input Directory: {batch_summary['input_directory']}\n")
+        f.write(f"Output Directory: {batch_summary['output_directory']}\n\n")
+        
+        f.write("SUMMARY:\n")
+        f.write(f"  Total Files: {batch_summary['total_files']}\n")
+        f.write(f"  Processed Successfully: {batch_summary['processed_files']}\n")
+        f.write(f"  Failed: {batch_summary['failed_files']}\n")
+        f.write(f"  Total Issues Found: {batch_summary['total_issues']}\n\n")
+        
+        # File-by-file results
+        f.write("INDIVIDUAL RESULTS:\n")
+        f.write("-" * 30 + "\n")
+        
+        for file_info in batch_summary['files']:
+            filename = file_info['filename']
+            status = file_info['status']
+            
+            if status == 'success':
+                issues = file_info['total_issues']
+                pages = file_info['pages']
+                status_text = "PASSED" if file_info['ok'] else f"{issues} ISSUES"
+                f.write(f"{filename:<40} [{status_text}] ({pages} pages)\n")
+            else:
+                error = file_info.get('error', 'Unknown error')
+                f.write(f"{filename:<40} [ERROR] {error}\n")
+
+def generate_rating_summary(batch_summary, output_file):
+    """Generate rating summary ranking PDFs from worst to best"""
+    with open(output_file, 'w') as f:
+        f.write("PDF VALIDATION RATING SUMMARY\n")
+        f.write("=" * 50 + "\n\n")
+        f.write("PDFs ranked from WORST to BEST quality\n")
+        f.write("(Based on total issues found per page)\n\n")
+        
+        # Filter successful files and calculate ratings
+        successful_files = [f for f in batch_summary['files'] if f['status'] == 'success']
+        
+        if not successful_files:
+            f.write("No successfully processed files to rate.\n")
+            return
+        
+        # Calculate issue density (issues per page) for ranking
+        rated_files = []
+        for file_info in successful_files:
+            pages = file_info.get('pages', 1)
+            issues = file_info.get('total_issues', 0)
+            issue_density = issues / pages if pages > 0 else issues
+            
+            # Determine quality grade
+            if issues == 0:
+                grade = "EXCELLENT"
+                grade_symbol = "★★★★★"
+            elif issue_density < 1:
+                grade = "VERY GOOD"
+                grade_symbol = "★★★★☆"
+            elif issue_density < 3:
+                grade = "GOOD"
+                grade_symbol = "★★★☆☆"
+            elif issue_density < 6:
+                grade = "FAIR" 
+                grade_symbol = "★★☆☆☆"
+            elif issue_density < 10:
+                grade = "POOR"
+                grade_symbol = "★☆☆☆☆"
+            else:
+                grade = "CRITICAL"
+                grade_symbol = "☆☆☆☆☆"
+            
+            rated_files.append({
+                'filename': file_info['filename'],
+                'total_issues': issues,
+                'pages': pages,
+                'issue_density': issue_density,
+                'grade': grade,
+                'grade_symbol': grade_symbol,
+                'ok': file_info.get('ok', False)
+            })
+        
+        # Sort by issue density (worst first)
+        rated_files.sort(key=lambda x: x['issue_density'], reverse=True)
+        
+        # Generate ranking
+        f.write(f"Total Files Rated: {len(rated_files)}\n")
+        f.write(f"Rating Scale: Issues per page (0 = Perfect, >10 = Critical)\n\n")
+        
+        f.write("RANKING (Worst to Best):\n")
+        f.write("-" * 80 + "\n")
+        f.write(f"{'Rank':<4} {'File':<35} {'Grade':<12} {'Issues':<8} {'Pages':<6} {'Density':<8}\n")
+        f.write("-" * 80 + "\n")
+        
+        for rank, file_info in enumerate(rated_files, 1):
+            filename = file_info['filename']
+            if len(filename) > 32:
+                filename = filename[:29] + "..."
+                
+            f.write(f"{rank:<4} {filename:<35} {file_info['grade']:<12} "
+                   f"{file_info['total_issues']:<8} {file_info['pages']:<6} "
+                   f"{file_info['issue_density']:<8.2f}\n")
+        
+        f.write("-" * 80 + "\n\n")
+        
+        # Summary statistics
+        f.write("QUALITY DISTRIBUTION:\n")
+        f.write("-" * 30 + "\n")
+        
+        grade_counts = {}
+        for file_info in rated_files:
+            grade = file_info['grade']
+            grade_counts[grade] = grade_counts.get(grade, 0) + 1
+        
+        grade_order = ["EXCELLENT", "VERY GOOD", "GOOD", "FAIR", "POOR", "CRITICAL"]
+        for grade in grade_order:
+            count = grade_counts.get(grade, 0)
+            if count > 0:
+                percentage = (count / len(rated_files)) * 100
+                f.write(f"{grade:<12}: {count:>3} files ({percentage:>5.1f}%)\n")
+        
+        f.write("\n")
+        
+        # Best and worst files
+        if len(rated_files) > 0:
+            best_file = rated_files[-1]  # Last in sorted list (lowest density)
+            worst_file = rated_files[0]   # First in sorted list (highest density)
+            
+            f.write("HIGHLIGHTS:\n")
+            f.write("-" * 30 + "\n")
+            f.write(f"Best Quality:  {best_file['filename']}\n")
+            f.write(f"               {best_file['grade']} - {best_file['total_issues']} issues "
+                   f"in {best_file['pages']} pages ({best_file['issue_density']:.2f} per page)\n\n")
+            f.write(f"Worst Quality: {worst_file['filename']}\n")
+            f.write(f"               {worst_file['grade']} - {worst_file['total_issues']} issues "
+                   f"in {worst_file['pages']} pages ({worst_file['issue_density']:.2f} per page)\n\n")
+            
+            # Recommendations
+            f.write("RECOMMENDATIONS:\n")
+            f.write("-" * 30 + "\n")
+            
+            critical_files = [f for f in rated_files if f['grade'] == 'CRITICAL']
+            poor_files = [f for f in rated_files if f['grade'] == 'POOR']
+            
+            if critical_files:
+                f.write(f"• {len(critical_files)} file(s) need immediate attention (CRITICAL quality)\n")
+            if poor_files:
+                f.write(f"• {len(poor_files)} file(s) have significant quality issues (POOR quality)\n")
+            
+            good_files = [f for f in rated_files if f['grade'] in ['EXCELLENT', 'VERY GOOD', 'GOOD']]
+            if good_files:
+                f.write(f"• {len(good_files)} file(s) meet acceptable quality standards\n")
+            
+            if not critical_files and not poor_files:
+                f.write("• All files meet acceptable quality standards\n")
+
+def process_single_pdf(args, verbose=True):
+    """Process a single PDF file"""
     doc = fitz.open(args.pdf)
     enable_advanced = not args.basic_only
+    
+    # Analyze margin structure for gutter-aware validation
+    margin_analysis = analyze_gutter_margins(doc, args.margin_pts)
     
     report = {
         "file": args.pdf,
@@ -1080,7 +1901,7 @@ def main():
     # Page-level checks
     for pno in range(len(doc)):
         page = doc[pno]
-        issues = check_page_enhanced(page, args.margin_pts, args.dpi_threshold, pno+1, len(doc), enable_advanced, doc)
+        issues = check_page_enhanced(page, args.margin_pts, args.dpi_threshold, pno+1, len(doc), enable_advanced, doc, margin_analysis)
         if issues:
             report["issues"][str(pno)] = issues
             total_issues += len(issues)
@@ -1110,35 +1931,40 @@ def main():
                     report["document_issues"], 
                     report["summary"])
 
-    # Enhanced console summary
-    print(f"\n=== PDF Validation Report for {args.pdf} ===")
-    print(f"Pages: {len(doc)}")
-    print(f"Advanced checks: {'enabled' if enable_advanced else 'disabled'}")
-    print(f"Total issues found: {total_issues}")
-    
-    if report["document_issues"]:
-        print(f"\nDocument-level issues: {len(report['document_issues'])}")
-        for issue in report["document_issues"][:5]:  # Show first 5
-            print(f"  - {issue['type']}: {issue['detail']}")
-        if len(report["document_issues"]) > 5:
-            print(f"  ... and {len(report['document_issues']) - 5} more")
-    
-    if report["issues"]:
-        print(f"\nPage-level issues: {sum(len(issues) for issues in report['issues'].values())}")
-        print(f"Pages affected: {len(report['issues'])}")
+    # Enhanced console summary (only if verbose)
+    if verbose:
+        print(f"\n=== PDF Validation Report for {args.pdf} ===")
+        print(f"Pages: {len(doc)}")
+        print(f"Advanced checks: {'enabled' if enable_advanced else 'disabled'}")
+        print(f"Total issues found: {total_issues}")
         
-        # Show issue type breakdown
-        if issue_types:
-            print("\nIssue breakdown:")
-            for issue_type, count in sorted(issue_types.items(), key=lambda x: x[1], reverse=True)[:10]:
-                print(f"  {issue_type}: {count}")
+        if report["document_issues"]:
+            print(f"\nDocument-level issues: {len(report['document_issues'])}")
+            for issue in report["document_issues"][:5]:  # Show first 5
+                print(f"  - {issue['type']}: {issue['detail']}")
+            if len(report["document_issues"]) > 5:
+                print(f"  ... and {len(report['document_issues']) - 5} more")
+        
+        if report["issues"]:
+            print(f"\nPage-level issues: {sum(len(issues) for issues in report['issues'].values())}")
+            print(f"Pages affected: {len(report['issues'])}")
+            
+            # Show issue type breakdown
+            if issue_types:
+                print("\nIssue breakdown:")
+                for issue_type, count in sorted(issue_types.items(), key=lambda x: x[1], reverse=True)[:10]:
+                    print(f"  {issue_type}: {count}")
+        
+        if total_issues == 0:
+            print("\n✓ No issues found - PDF appears to meet validation criteria")
+        else:
+            print(f"\n⚠ {total_issues} issues found - see detailed report for specifics")
     
-    if total_issues == 0:
-        print("\n✓ No issues found - PDF appears to meet validation criteria")
-    else:
-        print(f"\n⚠ {total_issues} issues found - see detailed report for specifics")
+    if verbose:
+        print(json.dumps(report["summary"], indent=2))
     
-    print(json.dumps(report["summary"], indent=2))
+    doc.close()
+    return 0 if total_issues == 0 else 1
 
 def check_hyphenation_at_breaks(page, next_page=None):
     """Check for hyphenated words at end of page breaks"""
