@@ -18,6 +18,288 @@ import numpy as np
 from collections import Counter, defaultdict
 from difflib import SequenceMatcher
 from datetime import datetime
+from typing import List, Tuple, Dict, Optional
+from dataclasses import dataclass
+
+
+@dataclass
+class TextRegion:
+    """Represents a text region with its type and boundaries"""
+    bbox: fitz.Rect
+    text_type: str  # 'body_single', 'body_left', 'body_right', 'header', 'footer', 'title', 'section_break', 'full_width'
+    confidence: float = 1.0
+    spans_count: int = 0  # Number of text spans in this region
+
+
+class DocumentLayout:
+    """Analyzes document-wide layout patterns"""
+    
+    def __init__(self, doc: fitz.Document):
+        self.doc = doc
+        self.has_facing_pages = False
+        self.has_gutters = False
+        self.left_page_left_margin = 36.0
+        self.left_page_right_margin = 36.0
+        self.right_page_left_margin = 36.0
+        self.right_page_right_margin = 36.0
+        self._analyze_document_layout()
+    
+    def _analyze_document_layout(self):
+        """Analyze first 10 pages to determine document layout pattern"""
+        sample_pages = min(10, len(self.doc))
+        if sample_pages < 4:
+            return
+            
+        page_margins = []
+        
+        for page_num in range(sample_pages):
+            page = self.doc[page_num]
+            spans = self._get_body_spans(page)
+            if spans:
+                left_edges = [s['bbox'].x0 for s in spans]
+                right_edges = [s['bbox'].x1 for s in spans]
+                left_margin = min(left_edges)
+                right_margin = page.rect.width - max(right_edges)
+                page_margins.append((left_margin, right_margin))
+        
+        if len(page_margins) >= 4:
+            # Separate odd and even pages (1-indexed)
+            odd_margins = [page_margins[i] for i in range(0, len(page_margins), 2)]  # Pages 1, 3, 5...
+            even_margins = [page_margins[i] for i in range(1, len(page_margins), 2)]  # Pages 2, 4, 6...
+            
+            if len(odd_margins) >= 2 and len(even_margins) >= 2:
+                odd_left_avg = sum(m[0] for m in odd_margins) / len(odd_margins)
+                odd_right_avg = sum(m[1] for m in odd_margins) / len(odd_margins)
+                even_left_avg = sum(m[0] for m in even_margins) / len(even_margins)
+                even_right_avg = sum(m[1] for m in even_margins) / len(even_margins)
+                
+                # Check if there's a significant alternating pattern
+                left_diff = abs(odd_left_avg - even_left_avg)
+                right_diff = abs(odd_right_avg - even_right_avg)
+                
+                if left_diff > 10 or right_diff > 10:  # Significant margin difference
+                    self.has_facing_pages = True
+                    self.has_gutters = True
+                    
+                    # Assign margins: odd pages = left-facing, even pages = right-facing
+                    self.left_page_left_margin = odd_left_avg
+                    self.left_page_right_margin = odd_right_avg
+                    self.right_page_left_margin = even_left_avg
+                    self.right_page_right_margin = even_right_avg
+    
+    def _get_body_spans(self, page: fitz.Page) -> List[Dict]:
+        """Get body text spans (excluding headers/footers)"""
+        raw = page.get_text("dict")
+        spans = []
+        
+        # Define body region as middle 70% of page height
+        page_height = page.rect.height
+        body_top = page_height * 0.15
+        body_bottom = page_height * 0.85
+        
+        for block in raw.get("blocks", []):
+            if block["type"] == 0:  # text block
+                for line in block.get("lines", []):
+                    for span in line.get("spans", []):
+                        bbox = span.get("bbox", [])
+                        text = span.get("text", "").strip()
+                        if bbox and text:
+                            center_y = (bbox[1] + bbox[3]) / 2
+                            if body_top <= center_y <= body_bottom:
+                                spans.append({
+                                    'bbox': fitz.Rect(bbox),
+                                    'text': text,
+                                    'center_y': center_y
+                                })
+        return spans
+
+
+class EnhancedColumnDetector:
+    """Enhanced column detector that replaces the old detect_column_boundaries function"""
+    
+    def __init__(self, page: fitz.Page, page_number: int = 1, document_layout: DocumentLayout = None):
+        self.page = page
+        self.page_number = page_number  # 1-indexed
+        self.page_width = page.rect.width
+        self.page_height = page.rect.height
+        self.document_layout = document_layout
+        
+        # Zone definitions
+        self.header_zone_end = self.page_height * 0.15
+        self.footer_zone_start = self.page_height * 0.85
+        
+        # Determine page position based on document layout
+        if document_layout and document_layout.has_facing_pages:
+            self.is_facing_page_layout = True
+            self.is_left_page = (page_number % 2 == 1)  # Odd pages = left-facing
+        else:
+            self.is_facing_page_layout = False
+            self.is_left_page = False
+    
+    def detect_column_boundaries(self) -> List[float]:
+        """Main method to detect column boundaries - returns list of divider positions"""
+        body_spans = self._get_body_spans()
+        layout = self._detect_column_layout(body_spans)
+        
+        if layout == 'double':
+            divider = self._find_column_divider(body_spans)
+            return [divider] if divider else []
+        else:
+            return []  # Single column
+    
+    def _get_body_spans(self) -> List[Dict]:
+        """Get body text spans for analysis"""
+        raw = self.page.get_text("dict")
+        spans = []
+        
+        for block in raw.get("blocks", []):
+            if block["type"] == 0:  # text block
+                for line in block.get("lines", []):
+                    for span in line.get("spans", []):
+                        bbox = span.get("bbox", [])
+                        text = span.get("text", "").strip()
+                        if bbox and text:
+                            center_y = (bbox[1] + bbox[3]) / 2
+                            if self.header_zone_end <= center_y <= self.footer_zone_start:
+                                spans.append({
+                                    'bbox': fitz.Rect(bbox),
+                                    'text': text,
+                                    'center_y': center_y
+                                })
+        return spans
+    
+    def _detect_column_layout(self, body_spans: List[Dict]) -> str:
+        """Detect if body text is single or double column"""
+        if not body_spans or len(body_spans) < 10:
+            return 'single'
+        
+        # Check for visual separator first - strong indicator of double column
+        visual_divider = self._detect_visual_separator()
+        if visual_divider:
+            # If there's a clear visual divider, check if text is balanced around it
+            left_spans = sum(1 for span in body_spans 
+                           if (span['bbox'].x0 + span['bbox'].x1) / 2 < visual_divider)
+            right_spans = sum(1 for span in body_spans 
+                            if (span['bbox'].x0 + span['bbox'].x1) / 2 > visual_divider)
+            
+            if left_spans >= 8 and right_spans >= 8:
+                return 'double'
+        
+        # Fallback to text distribution analysis
+        x_positions = []
+        for span in body_spans:
+            center_x = (span['bbox'].x0 + span['bbox'].x1) / 2
+            x_positions.append(center_x)
+        
+        x_positions.sort()
+        page_center = self.page_width / 2
+        
+        # Count spans in left and right halves
+        left_count = sum(1 for x in x_positions if x < page_center)
+        right_count = sum(1 for x in x_positions if x >= page_center)
+        
+        # Look for gap around center
+        center_tolerance = self.page_width * 0.08  # 8% of page width
+        center_spans = sum(1 for x in x_positions if abs(x - page_center) < center_tolerance)
+        
+        # Double column criteria:
+        total_spans = len(body_spans)
+        center_ratio = center_spans / total_spans
+        balance_ratio = min(left_count, right_count) / max(left_count, right_count) if max(left_count, right_count) > 0 else 0
+        
+        if (left_count >= 8 and right_count >= 8 and 
+            center_ratio < 0.2 and  # Less than 20% of spans in center
+            balance_ratio > 0.3):    # Reasonable balance between columns
+            return 'double'
+        else:
+            return 'single'
+    
+    def _find_column_divider(self, body_spans: List[Dict]) -> Optional[float]:
+        """Find the divider between columns using visual elements and gap detection"""
+        if not body_spans:
+            return None
+        
+        # Visual separator (black vertical line) is the absolute source of truth
+        visual_divider = self._detect_visual_separator()
+        if visual_divider:
+            return visual_divider
+        
+        # Only use text gap analysis when no visual divider exists
+        return self._detect_text_gap_divider(body_spans)
+    
+    def _detect_visual_separator(self) -> Optional[float]:
+        """Detect visual separator lines like vertical rules"""
+        paths = self.page.get_drawings()
+        
+        # Look for vertical lines that could be column separators
+        left_boundary = self.page_width * 0.2   # 20% from left
+        right_boundary = self.page_width * 0.8  # 20% from right
+        
+        candidates = []
+        
+        for path in paths:
+            # Look for vertical stroke paths
+            if path['type'] == 's':  # stroke path
+                items = path.get('items', [])
+                for item_type, *points in items:
+                    if item_type == 'l' and len(points) >= 2:  # line
+                        p1, p2 = points[:2]
+                        # Check if it's a substantial vertical line in the middle area
+                        if (abs(p1.x - p2.x) < 3 and  # Nearly vertical (allow slight angle)
+                            abs(p1.y - p2.y) > self.page_height * 0.3 and  # At least 30% of page height
+                            left_boundary <= p1.x <= right_boundary):  # In middle area
+                            candidates.append(p1.x)
+        
+        # If we found vertical lines, return the one closest to page center
+        if candidates:
+            page_center = self.page_width / 2
+            return min(candidates, key=lambda x: abs(x - page_center))
+        
+        return None
+    
+    def _detect_text_gap_divider(self, body_spans: List[Dict]) -> Optional[float]:
+        """Detect column divider based on largest horizontal text gap"""
+        # Collect all horizontal text positions
+        all_x_positions = []
+        for span in body_spans:
+            all_x_positions.extend([span['bbox'].x0, span['bbox'].x1])
+        
+        all_x_positions.sort()
+        
+        # Find the largest gap in the middle portion of the page
+        page_center = self.page_width / 2
+        center_zone_start = page_center - (self.page_width * 0.25)  # 25% left of center
+        center_zone_end = page_center + (self.page_width * 0.25)    # 25% right of center
+        
+        largest_gap = 0
+        best_divider = None
+        
+        for i in range(1, len(all_x_positions)):
+            gap_start = all_x_positions[i-1]
+            gap_end = all_x_positions[i]
+            gap_size = gap_end - gap_start
+            gap_center = (gap_start + gap_end) / 2
+            
+            # Only consider gaps in the center zone and larger than current best
+            if (gap_size > largest_gap and 
+                gap_size > 10 and  # Minimum meaningful gap
+                center_zone_start <= gap_center <= center_zone_end):
+                largest_gap = gap_size
+                best_divider = gap_center
+        
+        # Verify this creates a reasonable column split
+        if best_divider:
+            left_spans = sum(1 for span in body_spans 
+                           if (span['bbox'].x0 + span['bbox'].x1) / 2 < best_divider)
+            right_spans = sum(1 for span in body_spans 
+                            if (span['bbox'].x0 + span['bbox'].x1) / 2 > best_divider)
+            
+            # Need reasonable balance between columns
+            if left_spans >= 5 and right_spans >= 5:
+                return best_divider
+        
+        return None
+
 
 def simple_boundary_validation(page):
     """Simplified boundary validation - replaces complex margin detection"""
@@ -98,147 +380,20 @@ def rects_intersect(a, b, iou_thresh=0.05):
     union_area = a.get_area() + b.get_area() - inter_area
     return (inter_area / union_area) >= iou_thresh
 
-def detect_column_boundaries(page):
+def detect_column_boundaries(page, page_number=1, document_layout=None):
     """
-    Balanced column detection: Column widths should be always equal (and this is an error if they are not), but binding gutters shift the centerline.
-    Try block-based detection first, then fall back to span-based detection for PDFs with large blocks.
+    Enhanced column detection using the improved logic from columnDetection.py
+    
+    Args:
+        page: PyMuPDF page object
+        page_number: 1-indexed page number (for facing page detection)
+        document_layout: DocumentLayout object for gutter-aware detection
+    
+    Returns:
+        List of column divider positions (empty list for single column)
     """
-    raw = page.get_text("dict")
-    blocks = raw.get("blocks", [])
-    
-    page_width = page.rect.width
-    page_height = page.rect.height
-    
-    # Get body text only (excluding headers/footers)
-    header_zone = page_height * 0.1
-    footer_zone = page_height * 0.9
-    
-    # Try block-based detection first
-    body_blocks = []
-    for b in blocks:
-        if b["type"] == 0:  # text block
-            block_bbox = b.get("bbox", [])
-            if block_bbox:
-                block_center_y = (block_bbox[1] + block_bbox[3]) / 2
-                block_height = block_bbox[3] - block_bbox[1]
-                block_width = block_bbox[2] - block_bbox[0]
-                
-                # Only consider substantial body text blocks
-                if (header_zone < block_center_y < footer_zone and 
-                    block_height > 20 and block_width > 40):
-                    body_blocks.append(b)
-    
-    if not body_blocks:
-        return []  # No significant body text
-    
-    # Classify blocks as narrow (column) vs wide (spanning)
-    page_center = page_width / 2
-    narrow_blocks = []  # Likely column content
-    wide_blocks = []    # Likely spanning headers
-    
-    for block in body_blocks:
-        bbox = block["bbox"]
-        block_width = bbox[2] - bbox[0]
-        
-        # Wide blocks that span most of the page are likely headers/titles
-        if block_width > page_width * 0.6:
-            wide_blocks.append(block)
-        else:
-            narrow_blocks.append(block)
-    
-    # If we have enough narrow blocks, try block-based detection
-    if len(narrow_blocks) > 1:
-        left_column_blocks = []
-        right_column_blocks = []
-        
-        for block in narrow_blocks:
-            bbox = block["bbox"]
-            block_left = bbox[0]
-            block_right = bbox[2]
-            
-            if block_left < page_width * 0.3 and block_right < page_center + 20:
-                left_column_blocks.append(block)
-            elif block_left > page_center - 20 and block_right > page_width * 0.7:
-                right_column_blocks.append(block)
-        
-        # If we have blocks in both columns, calculate boundary
-        if left_column_blocks and right_column_blocks:
-            left_edges = [b["bbox"][2] for b in left_column_blocks]
-            right_edges = [b["bbox"][0] for b in right_column_blocks]
-            
-            left_column_end = max(left_edges)
-            right_column_start = min(right_edges)
-            gap_size = right_column_start - left_column_end
-            
-            if gap_size > 5:
-                all_left_edges = [b["bbox"][0] for b in left_column_blocks]
-                all_right_edges = [b["bbox"][2] for b in right_column_blocks]
-                
-                left_margin = min(all_left_edges)
-                right_margin = max(all_right_edges)
-                available_width = right_margin - left_margin
-                column_width = (available_width - gap_size) / 2
-                balanced_divider = left_margin + column_width + (gap_size / 2)
-                
-                return [balanced_divider]
-    
-    # Block-based detection failed, try span-based detection
-    # This handles PDFs where columns are spans within large blocks (like BRB)
-    all_spans = []
-    for b in blocks:
-        if b["type"] == 0:  # text block
-            for line in b.get("lines", []):
-                for span in line.get("spans", []):
-                    bbox = span.get("bbox", [])
-                    text = span.get("text", "").strip()
-                    if (bbox and text and 
-                        header_zone < (bbox[1] + bbox[3])/2 < footer_zone and
-                        bbox[2] - bbox[0] > 5):  # Minimum span width
-                        all_spans.append(bbox)
-    
-    if len(all_spans) < 10:  # Need reasonable amount of spans
-        return []
-    
-    # Classify spans by position with stricter boundaries to prevent overlap
-    left_spans = []
-    right_spans = []
-    
-    for bbox in all_spans:
-        span_center = (bbox[0] + bbox[2]) / 2
-        span_left = bbox[0]
-        span_right = bbox[2]
-        
-        # More restrictive column classification to avoid overlaps
-        # Left column: clearly in left half and doesn't extend past center
-        if span_center < page_center * 0.9 and span_right < page_center:
-            left_spans.append(bbox)
-        # Right column: clearly in right half and starts after center
-        elif span_center > page_center * 1.1 and span_left > page_center:
-            right_spans.append(bbox)
-    
-    # Need spans in both columns
-    if len(left_spans) < 5 or len(right_spans) < 5:
-        return []
-    
-    # Find the gap between columns
-    left_rights = [bbox[2] for bbox in left_spans]
-    right_lefts = [bbox[0] for bbox in right_spans]
-    
-    left_column_end = max(left_rights)
-    right_column_start = min(right_lefts)
-    gap_size = right_column_start - left_column_end
-    
-    if gap_size > 5:
-        # Calculate balanced divider
-        left_margin = min(bbox[0] for bbox in left_spans)
-        right_margin = max(bbox[2] for bbox in right_spans)
-        available_width = right_margin - left_margin
-        column_width = (available_width - gap_size) / 2
-        balanced_divider = left_margin + column_width + (gap_size / 2)
-        
-        return [balanced_divider]
-    
-    return []  # Single column fallback
+    detector = EnhancedColumnDetector(page, page_number, document_layout)
+    return detector.detect_column_boundaries()
 
 def text_spans_actually_overlap(rect1, text1, rect2, text2, column_boundaries=None):
     """
@@ -2339,6 +2494,9 @@ def process_single_pdf(args, verbose=True):
     doc = fitz.open(args.pdf)
     enable_advanced = not args.basic_only
     
+    # Create document layout analyzer for enhanced column detection
+    document_layout = DocumentLayout(doc)
+    
     # Analyze margin structure for gutter-aware validation
     margin_analysis = analyze_gutter_margins(doc, args.margin_pts)
     
@@ -2390,7 +2548,7 @@ def process_single_pdf(args, verbose=True):
     # Page-level checks
     for pno in range(len(doc)):
         page = doc[pno]
-        issues = check_page_enhanced(page, args.margin_pts, args.dpi_threshold, pno+1, len(doc), enable_advanced, doc, margin_analysis)
+        issues = check_page_enhanced(page, args.margin_pts, args.dpi_threshold, pno+1, len(doc), enable_advanced, doc, margin_analysis, document_layout)
         if issues:
             report["issues"][str(pno)] = issues
             total_issues += len(issues)

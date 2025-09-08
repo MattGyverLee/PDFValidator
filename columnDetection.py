@@ -23,8 +23,9 @@ from dataclasses import dataclass
 class TextRegion:
     """Represents a text region with its type and boundaries"""
     bbox: fitz.Rect
-    text_type: str  # 'body_single', 'body_left', 'body_right', 'header', 'footer', 'title'
+    text_type: str  # 'body_single', 'body_left', 'body_right', 'header', 'footer', 'title', 'section_break', 'full_width'
     confidence: float = 1.0
+    spans_count: int = 0  # Number of text spans in this region
 
 
 class DocumentLayout:
@@ -139,10 +140,16 @@ class ColumnDetector:
     def detect_text_regions(self) -> List[TextRegion]:
         """Main method to detect and return text regions"""
         spans_by_zone = self._classify_spans_by_zone()
-        layout = self._detect_column_layout(spans_by_zone['body'])
-        divider = self._find_column_divider(spans_by_zone['body']) if layout == 'double' else None
         
-        return self._create_boundaries(layout, divider, spans_by_zone)
+        # Enhanced vertical analysis
+        precise_zones = self._analyze_vertical_zones(spans_by_zone)
+        full_width_elements = self._detect_full_width_elements(precise_zones)
+        intervening_elements = self._detect_intervening_elements(precise_zones)
+        
+        layout = self._detect_column_layout(precise_zones['body'])
+        divider = self._find_column_divider(precise_zones['body']) if layout == 'double' else None
+        
+        return self._create_enhanced_boundaries(layout, divider, precise_zones, full_width_elements, intervening_elements)
     
     def _classify_spans_by_zone(self) -> Dict[str, List[Dict]]:
         """Classify spans into header, body, and footer zones"""
@@ -171,6 +178,243 @@ class ColumnDetector:
                                 zones['body'].append(span_data)
         
         return zones
+    
+    def _analyze_vertical_zones(self, zones: Dict[str, List[Dict]]) -> Dict[str, List[Dict]]:
+        """Analyze vertical zones to find precise boundaries and detect intervening elements"""
+        enhanced_zones = {'header': [], 'body': [], 'footer': [], 'intervening': []}
+        
+        # Get all spans sorted by vertical position
+        all_spans = []
+        for zone_name, spans in zones.items():
+            for span in spans:
+                span_copy = span.copy()
+                span_copy['original_zone'] = zone_name
+                all_spans.append(span_copy)
+        
+        all_spans.sort(key=lambda s: s['center_y'])
+        
+        if not all_spans:
+            return enhanced_zones
+        
+        # Find actual header/footer boundaries based on text distribution
+        page_height = self.page_height
+        header_threshold = page_height * 0.25  # Look in top 25%
+        footer_threshold = page_height * 0.75  # Look in bottom 25%
+        
+        # Identify gaps in text flow that indicate zone boundaries
+        y_positions = [span['center_y'] for span in all_spans]
+        gaps = self._find_significant_vertical_gaps(y_positions)
+        
+        # Determine precise zone boundaries
+        header_bottom = self._find_header_boundary(all_spans, header_threshold, gaps)
+        footer_top = self._find_footer_boundary(all_spans, footer_threshold, gaps)
+        
+        # Classify spans into precise zones
+        for span in all_spans:
+            y = span['center_y']
+            
+            if y <= header_bottom:
+                enhanced_zones['header'].append(span)
+            elif y >= footer_top:
+                enhanced_zones['footer'].append(span)
+            else:
+                # Check if this span breaks column flow (intervening element)
+                if self._is_intervening_element(span, all_spans):
+                    enhanced_zones['intervening'].append(span)
+                else:
+                    enhanced_zones['body'].append(span)
+        
+        return enhanced_zones
+    
+    def _find_significant_vertical_gaps(self, y_positions: List[float]) -> List[Tuple[float, float]]:
+        """Find significant vertical gaps in text flow"""
+        if len(y_positions) < 2:
+            return []
+        
+        gaps = []
+        sorted_positions = sorted(y_positions)
+        
+        for i in range(1, len(sorted_positions)):
+            gap_size = sorted_positions[i] - sorted_positions[i-1]
+            if gap_size > 15:  # Significant gap threshold
+                gaps.append((sorted_positions[i-1], sorted_positions[i]))
+        
+        return gaps
+    
+    def _find_header_boundary(self, spans: List[Dict], threshold: float, gaps: List[Tuple[float, float]]) -> float:
+        """Find precise header bottom boundary - only if substantial header content exists"""
+        # Only look in top 15% of page for actual header content
+        strict_header_threshold = self.page_height * 0.15
+        header_spans = [s for s in spans if s['center_y'] < strict_header_threshold]
+        
+        # Require minimum header content to create header zone
+        if not header_spans or len(header_spans) < 3:
+            return 0  # No meaningful header content
+        
+        # Find the lowest actual header span
+        lowest_header_y = max(span['bbox'].y1 for span in header_spans)
+        
+        # Look for a significant gap after the header
+        for gap_start, gap_end in gaps:
+            if gap_start > lowest_header_y and gap_end < threshold and (gap_end - gap_start) > 10:
+                return gap_start
+        
+        return lowest_header_y
+    
+    def _find_footer_boundary(self, spans: List[Dict], threshold: float, gaps: List[Tuple[float, float]]) -> float:
+        """Find precise footer top boundary - only if substantial footer content exists"""
+        # Only look in bottom 10% of page for actual footer content (much stricter)
+        strict_footer_threshold = self.page_height * 0.9
+        potential_footer_spans = [s for s in spans if s['center_y'] > strict_footer_threshold]
+        
+        # Additional filtering: footer content should be short text (page numbers, etc.)
+        # Filter out long text that's likely body content misplaced in footer area
+        footer_spans = []
+        for span in potential_footer_spans:
+            text = span.get('text', '').strip()
+            # Footer content should be short (page numbers, chapter refs, etc.)
+            if len(text) <= 20 and (text.isdigit() or len(text.split()) <= 3):
+                footer_spans.append(span)
+        
+        # Require minimum footer content to create footer zone
+        if not footer_spans or len(footer_spans) < 2:  # Even stricter - just 2+ short spans
+            return self.page_height  # No meaningful footer content
+        
+        # Find the highest actual footer span
+        highest_footer_y = min(span['bbox'].y0 for span in footer_spans)
+        
+        # Look for a significant gap before the footer
+        for gap_start, gap_end in gaps:
+            if gap_end < highest_footer_y and gap_start > threshold * 0.5 and (gap_end - gap_start) > 15:
+                return gap_end
+        
+        return highest_footer_y
+    
+    def _is_intervening_element(self, span: Dict, all_spans: List[Dict]) -> bool:
+        """Check if a span is an intervening element that breaks column flow"""
+        # Only detect truly significant intervening elements, not small text breaks
+        span_width = span['bbox'].x1 - span['bbox'].x0
+        page_center = self.page_width / 2
+        span_center = (span['bbox'].x0 + span['bbox'].x1) / 2
+        
+        # Must be significantly wide (crosses significant portion of page)
+        if span_width < self.page_width * 0.4:  # Must be at least 40% of page width
+            return False
+        
+        # Get nearby spans for comparison
+        y_tolerance = 30  # Look within 30pts vertically
+        nearby_spans = [s for s in all_spans if abs(s['center_y'] - span['center_y']) > y_tolerance 
+                       and abs(s['center_y'] - span['center_y']) < y_tolerance * 3]
+        
+        if nearby_spans:
+            avg_width = sum(s['bbox'].x1 - s['bbox'].x0 for s in nearby_spans) / len(nearby_spans)
+            
+            # Intervening only if significantly wider, centered, and crosses columns
+            if (span_width > avg_width * 2.0 and  # Much more restrictive
+                abs(span_center - page_center) < self.page_width * 0.15 and  # Better centered
+                span_width > self.page_width * 0.5):  # Crosses most of page
+                return True
+        
+        # Check for title-like characteristics - but be very restrictive
+        text = span.get('text', '').strip()
+        if len(text) > 10 and span_width > self.page_width * 0.5:  # Must be substantial text and width
+            # All caps titles or clear section headers
+            if (text.isupper() and len(text.split()) <= 4) or \
+               (text.istitle() and len(text.split()) <= 3 and any(word in text.upper() for word in ['CHAPTER', 'SECTION', 'PART'])):
+                return True
+        
+        return False
+    
+    def _detect_full_width_elements(self, zones: Dict[str, List[Dict]]) -> List[Dict]:
+        """Detect elements that span the full width of the page"""
+        full_width_elements = []
+        
+        # Analyze intervening elements to see which are full-width
+        for span in zones.get('intervening', []):
+            span_width = span['bbox'].x1 - span['bbox'].x0
+            span_left = span['bbox'].x0
+            span_right = span['bbox'].x1
+            
+            # Check if element spans most of the page width
+            page_margin = 50  # Consider 50pt margins
+            effective_page_width = self.page_width - (2 * page_margin)
+            
+            if (span_width > effective_page_width * 0.7 and  # At least 70% of page width
+                span_left < page_margin * 2 and  # Starts near left margin
+                span_right > self.page_width - page_margin * 2):  # Ends near right margin
+                
+                full_width_elements.append({
+                    'span': span,
+                    'type': self._classify_full_width_element(span),
+                    'y_position': span['center_y']
+                })
+        
+        return full_width_elements
+    
+    def _classify_full_width_element(self, span: Dict) -> str:
+        """Classify the type of full-width element"""
+        text = span.get('text', '').strip()
+        
+        # Check text characteristics
+        if text.isupper() and len(text.split()) <= 4:
+            return 'section_title'
+        elif text.istitle() and len(text.split()) <= 6:
+            return 'chapter_title'  
+        elif text.count('.') > 2 or text.count('_') > 5:
+            return 'separator_line'
+        else:
+            return 'full_width_text'
+    
+    def _detect_intervening_elements(self, zones: Dict[str, List[Dict]]) -> List[Dict]:
+        """Detect elements that intervene in the normal column flow"""
+        intervening = []
+        
+        # Get body text sorted by vertical position
+        body_spans = sorted(zones.get('body', []), key=lambda s: s['center_y'])
+        intervening_spans = zones.get('intervening', [])
+        
+        for int_span in intervening_spans:
+            int_y = int_span['center_y']
+            
+            # Find body text above and below this element
+            above_spans = [s for s in body_spans if s['center_y'] < int_y - 10]
+            below_spans = [s for s in body_spans if s['center_y'] > int_y + 10]
+            
+            if above_spans and below_spans:
+                # This element interrupts the flow
+                intervening.append({
+                    'span': int_span,
+                    'interrupts_flow': True,
+                    'above_count': len(above_spans),
+                    'below_count': len(below_spans),
+                    'element_type': self._classify_intervening_element(int_span)
+                })
+            else:
+                # This element is at the beginning or end
+                intervening.append({
+                    'span': int_span,
+                    'interrupts_flow': False,
+                    'element_type': self._classify_intervening_element(int_span)
+                })
+        
+        return intervening
+    
+    def _classify_intervening_element(self, span: Dict) -> str:
+        """Classify the type of intervening element"""
+        text = span.get('text', '').strip()
+        span_width = span['bbox'].x1 - span['bbox'].x0
+        
+        # Font size analysis (if available)
+        font_size = span.get('size', 12)
+        
+        if font_size > 14:
+            return 'heading'
+        elif text.isupper():
+            return 'section_header'
+        elif span_width > self.page_width * 0.6:
+            return 'wide_element'
+        else:
+            return 'text_break'
     
     def _detect_column_layout(self, body_spans: List[Dict]) -> str:
         """Detect if body text is single or double column"""
@@ -308,145 +552,217 @@ class ColumnDetector:
         
         return None
     
-    def _create_boundaries(self, layout: str, divider: Optional[float], 
-                          spans_by_zone: Dict[str, List[Dict]]) -> List[TextRegion]:
-        """Create text region boundaries with visual margins"""
+    def _create_enhanced_boundaries(self, layout: str, divider: Optional[float], 
+                                   zones: Dict[str, List[Dict]], 
+                                   full_width_elements: List[Dict],
+                                   intervening_elements: List[Dict]) -> List[TextRegion]:
+        """Create enhanced text region boundaries with precise zones and intervening elements"""
         regions = []
-        body_spans = spans_by_zone['body']
         
+        # Create precise header regions (only where substantial text actually exists)
+        if zones['header'] and len(zones['header']) >= 3:
+            header_spans = zones['header']
+            header_x = [coord for span in header_spans for coord in [span['bbox'].x0, span['bbox'].x1]]
+            header_y = [coord for span in header_spans for coord in [span['bbox'].y0, span['bbox'].y1]]
+            
+            boundary_margin = 2.0
+            header_region = TextRegion(
+                bbox=fitz.Rect(
+                    max(0, min(header_x) - boundary_margin),
+                    min(header_y) - boundary_margin,
+                    min(self.page_width, max(header_x) + boundary_margin),
+                    max(header_y) + boundary_margin
+                ),
+                text_type='header',
+                spans_count=len(header_spans)
+            )
+            regions.append(header_region)
+        
+        # Create precise footer regions (only where substantial text actually exists)
+        if zones['footer'] and len(zones['footer']) >= 2:  # Match the stricter footer criteria
+            footer_spans = zones['footer']
+            footer_x = [coord for span in footer_spans for coord in [span['bbox'].x0, span['bbox'].x1]]
+            footer_y = [coord for span in footer_spans for coord in [span['bbox'].y0, span['bbox'].y1]]
+            
+            boundary_margin = 2.0
+            footer_region = TextRegion(
+                bbox=fitz.Rect(
+                    max(0, min(footer_x) - boundary_margin),
+                    min(footer_y) - boundary_margin,
+                    min(self.page_width, max(footer_x) + boundary_margin),
+                    max(footer_y) + boundary_margin
+                ),
+                text_type='footer',
+                spans_count=len(footer_spans)
+            )
+            regions.append(footer_region)
+        
+        # Create body regions (excluding intervening elements)
+        body_spans = zones['body']
+        if body_spans:
+            regions.extend(self._create_body_regions(layout, divider, body_spans))
+        
+        # Create regions for full-width elements
+        for fw_element in full_width_elements:
+            span = fw_element['span']
+            boundary_margin = 3.0  # Slightly larger margin for full-width elements
+            
+            fw_region = TextRegion(
+                bbox=fitz.Rect(
+                    span['bbox'].x0 - boundary_margin,
+                    span['bbox'].y0 - boundary_margin,
+                    span['bbox'].x1 + boundary_margin,
+                    span['bbox'].y1 + boundary_margin
+                ),
+                text_type=fw_element['type'],
+                spans_count=1
+            )
+            regions.append(fw_region)
+        
+        # Create regions for intervening elements (that aren't full-width)
+        for int_element in intervening_elements:
+            span = int_element['span']
+            
+            # Skip if already covered by full-width elements
+            is_full_width = any(abs(fw['y_position'] - span['center_y']) < 5 for fw in full_width_elements)
+            if is_full_width:
+                continue
+            
+            boundary_margin = 2.0
+            int_region = TextRegion(
+                bbox=fitz.Rect(
+                    span['bbox'].x0 - boundary_margin,
+                    span['bbox'].y0 - boundary_margin,
+                    span['bbox'].x1 + boundary_margin,
+                    span['bbox'].y1 + boundary_margin
+                ),
+                text_type='intervening_' + int_element['element_type'],
+                spans_count=1
+            )
+            regions.append(int_region)
+        
+        return regions
+    
+    def _create_body_regions(self, layout: str, divider: Optional[float], body_spans: List[Dict]) -> List[TextRegion]:
+        """Create body text regions with precise boundaries"""
         if not body_spans:
-            return regions
+            return []
         
-        # Get text bounds
+        regions = []
+        boundary_margin = 2.0
+        
+        # Get body text bounds
         all_body_x = [coord for span in body_spans for coord in [span['bbox'].x0, span['bbox'].x1]]
         all_body_y = [coord for span in body_spans for coord in [span['bbox'].y0, span['bbox'].y1]]
         
-        # Calculate boundaries with visual clearance
-        boundary_margin = 2.0  # Visual clearance around text
         min_y = min(all_body_y) - boundary_margin
         max_y = max(all_body_y) + boundary_margin
         
-        # Determine horizontal boundaries based on document layout
+        # Determine horizontal boundaries
         if self.document_layout and self.document_layout.has_facing_pages:
-            if self.is_left_page:
-                # Left-facing page: use document's left page margins
-                text_left = min(all_body_x)
-                text_right = max(all_body_x)
-                min_x = max(0, text_left - boundary_margin)
-                max_x = min(self.page_width, text_right + boundary_margin)
-            else:
-                # Right-facing page: use document's right page margins  
-                text_left = min(all_body_x)
-                text_right = max(all_body_x)
-                min_x = max(0, text_left - boundary_margin)
-                max_x = min(self.page_width, text_right + boundary_margin)
+            text_left = min(all_body_x)
+            text_right = max(all_body_x)
+            min_x = max(0, text_left - boundary_margin)
+            max_x = min(self.page_width, text_right + boundary_margin)
         else:
-            # Standard single-page layout
             min_x = max(36.0, min(all_body_x) - boundary_margin)
             max_x = min(self.page_width - 36.0, max(all_body_x) + boundary_margin)
         
-        # Create body regions
         if layout == 'double' and divider:
-            # Check if this divider came from a visual separator (definitive center)
+            # Create left and right column regions with enhanced logic
             visual_divider = self._detect_visual_separator()
             
-            if visual_divider and abs(visual_divider - divider) < 1:  # Same divider
-                # Visual separator: allow inner boundaries to hug text more closely
-                # Find actual text boundaries for each column
-                tolerance = 10.0  # pts tolerance around visual separator
+            if visual_divider and abs(visual_divider - divider) < 1:
+                # Enhanced visual separator logic
+                tolerance = 10.0
                 left_column_text = [span for span in body_spans if span['bbox'].x1 < divider - tolerance]
                 right_column_text = [span for span in body_spans if span['bbox'].x0 > divider + tolerance]
                 
                 if left_column_text and right_column_text:
-                    # Get text edges for each column
                     rightmost_left_text = max(span['bbox'].x1 for span in left_column_text)
                     leftmost_right_text = min(span['bbox'].x0 for span in right_column_text)
                     
-                    # Calculate inner boundaries with 2pt space from text and 6pt movement limit
-                    text_clearance = 2.0  # 2pt space between text and inner boundary
+                    text_clearance = 2.0
                     max_movement = 4.0
                     
-                    # Left column right boundary: text + 2pt clearance, max 4pts from center
                     left_inner_boundary = max(divider - max_movement, rightmost_left_text + text_clearance)
-                    
-                    # Right column left boundary: text - 2pt clearance, max 4pts from center  
                     right_inner_boundary = min(divider + max_movement, leftmost_right_text - text_clearance)
                     
-                    # Maintain symmetric outer boundaries
                     left_boundary_distance = divider - min_x
                     final_right_boundary = min(divider + left_boundary_distance, self.page_width)
                     
                     left_region = TextRegion(
                         bbox=fitz.Rect(min_x, min_y, left_inner_boundary, max_y),
-                        text_type='body_left'
+                        text_type='body_left',
+                        spans_count=len(left_column_text)
                     )
                     right_region = TextRegion(
                         bbox=fitz.Rect(right_inner_boundary, min_y, final_right_boundary, max_y),
-                        text_type='body_right'
+                        text_type='body_right', 
+                        spans_count=len(right_column_text)
                     )
                     regions.extend([left_region, right_region])
                 else:
-                    # Fallback to center line if no text found
-                    left_boundary_distance = divider - min_x
-                    final_right_boundary = min(divider + left_boundary_distance, self.page_width)
+                    # Fallback to simple divider
+                    left_spans = [s for s in body_spans if s['bbox'].x1 < divider]
+                    right_spans = [s for s in body_spans if s['bbox'].x0 > divider]
                     
                     left_region = TextRegion(
                         bbox=fitz.Rect(min_x, min_y, divider, max_y),
-                        text_type='body_left'
+                        text_type='body_left',
+                        spans_count=len(left_spans)
                     )
                     right_region = TextRegion(
-                        bbox=fitz.Rect(divider, min_y, final_right_boundary, max_y),
-                        text_type='body_right'
+                        bbox=fitz.Rect(divider, min_y, max_x, max_y),
+                        text_type='body_right',
+                        spans_count=len(right_spans)
                     )
                     regions.extend([left_region, right_region])
             else:
-                # Text-based divider: use actual text boundaries
+                # Text-based divider
+                left_spans = [s for s in body_spans if (s['bbox'].x0 + s['bbox'].x1) / 2 < divider]
+                right_spans = [s for s in body_spans if (s['bbox'].x0 + s['bbox'].x1) / 2 > divider]
+                
                 left_region = TextRegion(
                     bbox=fitz.Rect(min_x, min_y, divider, max_y),
-                    text_type='body_left'
+                    text_type='body_left',
+                    spans_count=len(left_spans)
                 )
                 right_region = TextRegion(
                     bbox=fitz.Rect(divider, min_y, max_x, max_y),
-                    text_type='body_right'
+                    text_type='body_right',
+                    spans_count=len(right_spans)
                 )
                 regions.extend([left_region, right_region])
         else:
+            # Single column
             single_region = TextRegion(
                 bbox=fitz.Rect(min_x, min_y, max_x, max_y),
-                text_type='body_single'
+                text_type='body_single',
+                spans_count=len(body_spans)
             )
             regions.append(single_region)
-        
-        # Add header and footer regions if they exist
-        for zone_name in ['header', 'footer']:
-            zone_spans = spans_by_zone[zone_name]
-            if zone_spans:
-                zone_x = [coord for span in zone_spans for coord in [span['bbox'].x0, span['bbox'].x1]]
-                zone_y = [coord for span in zone_spans for coord in [span['bbox'].y0, span['bbox'].y1]]
-                
-                zone_min_x = max(0, min(zone_x) - boundary_margin)
-                zone_max_x = min(self.page_width, max(zone_x) + boundary_margin)
-                zone_min_y = min(zone_y) - boundary_margin
-                zone_max_y = max(zone_y) + boundary_margin
-                
-                zone_region = TextRegion(
-                    bbox=fitz.Rect(zone_min_x, zone_min_y, zone_max_x, zone_max_y),
-                    text_type=zone_name
-                )
-                regions.append(zone_region)
         
         return regions
 
 
 def annotate_page_boundaries(page: fitz.Page, regions: List[TextRegion]) -> None:
-    """Add green boundary annotations to a page"""
+    """Add colored boundary annotations to a page"""
     colors = {
-        'body_single': [0, 0.8, 0],      # Green
-        'body_left': [0, 0.8, 0],        # Green
-        'body_right': [0, 0.8, 0],       # Green
-        'header': [0, 0.6, 0.8],         # Teal
-        'footer': [0, 0.6, 0.8],         # Teal
-        'title': [0.8, 0.4, 0]           # Orange
+        'body_single': [0, 0.8, 0],          # Green
+        'body_left': [0, 0.8, 0],            # Green  
+        'body_right': [0, 0.8, 0],           # Green
+        'header': [0, 0.6, 0.8],             # Teal
+        'footer': [0, 0.6, 0.8],             # Teal
+        'section_title': [0.8, 0.4, 0],      # Orange
+        'chapter_title': [0.9, 0.3, 0.1],    # Red-orange
+        'full_width_text': [0.7, 0.5, 0.2],  # Golden
+        'separator_line': [0.5, 0.5, 0.5],   # Gray
+        'intervening_heading': [0.8, 0, 0.8], # Magenta
+        'intervening_section_header': [0.6, 0, 0.6], # Purple
+        'intervening_wide_element': [0.4, 0.7, 0.9], # Light blue
+        'intervening_text_break': [0.9, 0.7, 0.4],   # Yellow
+        'title': [0.8, 0.4, 0]               # Orange (legacy)
     }
     
     for region in regions:
@@ -481,9 +797,26 @@ def process_pdf(input_path: str, output_path: str) -> None:
             
             print(f"Page {page_num + 1}: {len(regions)} text regions detected{facing_info}")
             
-            # Show detected regions
+            # Group regions by type for cleaner output
+            region_groups = {}
             for region in regions:
-                print(f"  {region.text_type}: {region.bbox}")
+                if region.text_type not in region_groups:
+                    region_groups[region.text_type] = []
+                region_groups[region.text_type].append(region)
+            
+            # Show detected regions with counts
+            for region_type, region_list in region_groups.items():
+                if len(region_list) == 1:
+                    region = region_list[0] 
+                    spans_info = f" ({region.spans_count} spans)" if region.spans_count > 0 else ""
+                    print(f"  {region_type}{spans_info}: {region.bbox}")
+                else:
+                    total_spans = sum(r.spans_count for r in region_list)
+                    spans_info = f" ({total_spans} spans total)" if total_spans > 0 else ""
+                    print(f"  {region_type} ({len(region_list)} regions{spans_info}):")
+                    for i, region in enumerate(region_list):
+                        region_spans_info = f" ({region.spans_count} spans)" if region.spans_count > 0 else ""
+                        print(f"    [{i+1}]{region_spans_info}: {region.bbox}")
             
             # Add annotations
             annotate_page_boundaries(page, regions)
